@@ -85,7 +85,7 @@ def prepare_baseline(
             DSP-tier fields averaged to give the positive and negative
             baselines.  Default ``"trapTmax"`` and ``"trapTmin"``.
     debug_mode
-        If True, re-raise instead of falling back to a nan result.
+        If True, re-raise instead of falling back to a null result.
 
     Returns
     -------
@@ -101,8 +101,8 @@ def prepare_baseline(
     negative_param = config.get("negative_param", DEFAULT_NEGATIVE_PARAM)
 
     success = True
-    positive_baseline = np.nan
-    negative_baseline = np.nan
+    positive_baseline = None
+    negative_baseline = None
 
     try:
         try:
@@ -162,17 +162,11 @@ def prepare_baseline(
             e
         )
         success = False
-        positive_baseline = np.nan
-        negative_baseline = np.nan
 
     return {
         "detector_id": chn_id,
-        "positive_baseline": (
-            None if np.isnan(positive_baseline) else positive_baseline
-        ),
-        "negative_baseline": (
-            None if np.isnan(negative_baseline) else negative_baseline
-        ),
+        "positive_baseline": positive_baseline,
+        "negative_baseline": negative_baseline,
         "success": success,
         "processed_at": datetime.now().isoformat(),
         "parameters": {
@@ -186,16 +180,9 @@ def prepare_baseline(
     }
 
 
-# merge baseline?
-
-
 def _resolve_baseline(baseline: dict, chn_id: str | int) -> tuple[float, float] | None:
-    """Return ``(positive, negative)`` for *chn_id*, or None if unusable.
-
-    A channel is unusable when it is absent from *baseline* or either of its
-    two values is ``None`` or NaN -- the replacement for the old
-    ``skipped_channels.npy``.  Both ``int`` and ``str`` keys are accepted,
-    since a *baseline* round-tripped through JSON has string keys.
+    """
+    Return ``(positive, negative)`` for *chn_id*, or None if unusable.
     """
     entry = baseline.get(chn_id)
     if entry is None:
@@ -221,8 +208,7 @@ def _build_hist(
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Histogram *vals* over ``mean +/- range_multiplier * stdev``.
 
-    Returns ``None`` when the sample is empty or has no usable spread, in
-    which case the caller records an empty histogram for the element.
+    Returns ``None`` when the sample is empty or has no usable spread.
     """
     if vals.size == 0:
         return None
@@ -252,14 +238,12 @@ def xtalk_column(
     Selects the events in which *trigger_detector_id* fired with 
     high enough energy (determined by *trigger_energy_range* in *config*). 
 
-    Then, for each detector in *chn_id_list*, among these events, it 
+    Then, for each detector in the keys of *baseline*, among these events, it 
     further selects the events in which the detector did *not* 
     fire with high energy (otherwise it's multiplicity event).
 
     Finally, calculates the per-event cross talk value for each of these events
     and fills them into a histogram. 
-
-    This produces N=number of detectors histograms, one for each detector in *chn_id_list*.
 
     Detector pairs skipped are recorded with ``valid = False`` and an empty
     histogram. This happens when the response channel is the trigger itself, or when
@@ -399,7 +383,7 @@ def xtalk_column(
 
     # loop over response detectors starts here 
     # If trigger selection failed or the trigger baseline is None, 
-    # skip to saving an empty column. 
+    # skip the whole loop to saving an empty column. 
     if trigger_selection is not None:
         for k, response_id in enumerate(chn_id_list):
             if str(response_id) == str(trigger_detector_id):
@@ -546,8 +530,7 @@ def _fit_one_histogram(
 
     x = 0.5 * (bins[1:] + bins[:-1])
 
-    # too few counts for a fit to mean anything: the moments still describe
-    # where the distribution sits, so report those rather than nothing
+    # too few counts, fallback to histogram arithmetic mean 
     if total_counts < low_stats_threshold:
         mu = float(np.sum(x * y) / total_counts)
         sigma = float(np.sqrt(np.sum(y * (x - mu) ** 2) / total_counts))
@@ -556,8 +539,7 @@ def _fit_one_histogram(
     # fit the peak rather than the tails
     mask = y > y_mask_threshold * np.max(y)
     if int(mask.sum()) < sharp_fit_min_points:
-        # the peak is sharp enough that the mask leaves too little to fit;
-        # falling back to every bin is better than not fitting at all
+        # peak too sharp, fallback to no mask
         mask = np.ones_like(y, dtype=bool)
         status = FIT_STATUS["ok_few_points"]
     else:
@@ -569,10 +551,7 @@ def _fit_one_histogram(
     mu_0 = float(np.average(x_fit, weights=y_fit))
     sigma_0 = float(np.sqrt(np.average((x_fit - mu_0) ** 2, weights=y_fit)))
     if sigma_0 <= 0:
-        # every count sits in one bin, so the moment gives no width at all;
-        # seeding with the bin width keeps the gaussian from collapsing to a
-        # zero-division at the first step
-        sigma_0 = float(x[1] - x[0]) if len(x) > 1 else 1.0
+        sigma_0 = float(x[1] - x[0]) if len(x) > 1 else 1.0 # Prevent ZeroDivisionError
 
     try:
         popt, _ = curve_fit(_gaussian, x_fit, y_fit, p0=[amplitude_0, mu_0, sigma_0])
@@ -581,8 +560,6 @@ def _fit_one_histogram(
         return np.nan, np.nan, np.nan, total_counts, FIT_STATUS["fit_failed"]
 
     amplitude, mu, sigma = (float(v) for v in popt)
-    # only sigma**2 enters the gaussian, so curve_fit is free to return a
-    # negative width for the same curve
     return amplitude, mu, abs(sigma), total_counts, status
 
 
@@ -593,9 +570,7 @@ def xtalk_histogram_fitter(
 ) -> dict:
     """Fit a gaussian to every histogram of one cross-talk column.
 
-    *histogram_data* is the dict :func:`xtalk_column` returns.  Keeping the
-    two steps apart is what lets a column be refitted with different
-    thresholds without refilling its histograms.
+    *histogram_data* is exactly the dict :func:`xtalk_column` returns.
 
     Every element is fitted twice, once against the negative and once against
     the positive response, and each fit lands in one of the outcomes of
@@ -731,19 +706,6 @@ def build_xtalk_matrix(
 ) -> XTCMatrix:
     """Assemble the fitted columns of a cross-talk matrix into the matrix.
 
-    *fitted_columns* collects what :func:`xtalk_histogram_fitter` returned for
-    each trigger, keyed by that trigger's channel id, the way *baseline*
-    collects what :func:`prepare_baseline` returned for each channel::
-
-        {1104000: xtalk_histogram_fitter(...), 1104001: ..., ...}
-
-    Each of those columns is one row of the matrix, so the rows are triggers
-    and the columns are responses.  Every column must cover the same
-    detectors in the same order -- they do when one *baseline* drove all of
-    them -- and that order becomes the matrix index.  A detector that no
-    column was filled for keeps a row of NaN rather than being dropped, so
-    the index stays the detector list rather than the subset that worked.
-
     Parameters
     ----------
     fitted_columns
@@ -753,11 +715,8 @@ def build_xtalk_matrix(
         Recognised keys, all optional:
 
         ``max_status``
-            Highest :data:`FIT_STATUS` code to accept into the matrix; the
-            codes are ordered from the most to the least trustworthy, so this
-            is a quality cut.  Default ``FIT_STATUS["low_stats"]``, which
-            keeps the moments of a sparse histogram, as the production files
-            do, and drops everything that has no position to report anyway.
+            Highest :data:`FIT_STATUS` code to accept into the matrix. Default 
+            ``FIT_STATUS["low_stats"]``.
 
     Returns
     -------
