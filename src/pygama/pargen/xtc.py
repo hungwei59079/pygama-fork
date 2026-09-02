@@ -8,12 +8,9 @@ prepare_baseline, xtalk_column, xtalk_histogram_fitter, and build_xtalk_matrix.
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
-from pathlib import Path
 
-import lgdo
 import lh5
 import numpy as np
 from scipy.optimize import curve_fit
@@ -54,9 +51,7 @@ def prepare_baseline(
     hit_files: str | list,
     dsp_files: str | list,
     chn_id: str | int,
-    out_path: str | Path | None = None,
     config: dict | None = None,
-    display: int = 0,
     debug_mode: bool = False,
 ) -> dict:
     """Measure the positive and negative baselines of a single channel.
@@ -64,9 +59,6 @@ def prepare_baseline(
     Selects baseline events in the hit tier -- those whose flag fields match
     ``config["baseline_conditions"]`` -- then averages the corresponding
     positive- and negative-going DSP amplitudes over exactly those events.
-
-    The result is written to *out_path* as JSON and also returned, so a
-    caller that keeps the value in memory need not read it back.
 
     Parameters
     ----------
@@ -79,9 +71,6 @@ def prepare_baseline(
         Channel identifier (rawid) of the detector, without the ``ch``
         prefix.  Tables are read from ``ch{chn_id}/hit/`` and
         ``ch{chn_id}/dsp/``.
-    out_path
-        JSON file to write the result to; parent directories are created.
-        ``None`` computes the result and returns it without writing.
     config
         Selection configuration.  Recognised keys, all optional:
 
@@ -95,10 +84,6 @@ def prepare_baseline(
         ``positive_param``, ``negative_param``
             DSP-tier fields averaged to give the positive and negative
             baselines.  Default ``"trapTmax"`` and ``"trapTmin"``.
-    display
-        If greater than zero, write a before/after selection histogram for
-        each DSP parameter next to *out_path*.  Ignored when *out_path* is
-        ``None``.
     debug_mode
         If True, re-raise instead of falling back to a nan result.
 
@@ -115,15 +100,9 @@ def prepare_baseline(
     positive_param = config.get("positive_param", DEFAULT_POSITIVE_PARAM)
     negative_param = config.get("negative_param", DEFAULT_NEGATIVE_PARAM)
 
-    out_path = Path(out_path) if out_path is not None else None
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
     success = True
     positive_baseline = np.nan
     negative_baseline = np.nan
-    positive_selection = None
-    negative_selection = None
 
     try:
         try:
@@ -186,25 +165,7 @@ def prepare_baseline(
         positive_baseline = np.nan
         negative_baseline = np.nan
 
-    # display plots run outside the guarding path so a plotting failure cannot
-    # turn a good measurement into a nan result
-    if display > 0 and success:
-        if out_path is None:
-            log.warning(
-                "prepare_baseline: display=%s ignored, no out_path to write plots next to",
-                display,
-            )
-        else:
-            for selection, param in (
-                (positive_selection, positive_param),
-                (negative_selection, negative_param),
-            ):
-                try:
-                    selection.draw(out_path.with_name(f"{out_path.stem}_{param}.png"))
-                except Exception as e:
-                    log.debug("prepare_baseline: %s display plot failed: %s", param, e)
-
-    result = {
+    return {
         "detector_id": chn_id,
         "positive_baseline": (
             None if np.isnan(positive_baseline) else positive_baseline
@@ -223,12 +184,6 @@ def prepare_baseline(
             "n_dsp_files": 1 if isinstance(dsp_files, str) else len(dsp_files),
         },
     }
-
-    if out_path is not None:
-        out_path.write_text(json.dumps(result, indent=2))
-        log.info("baseline of channel %s written to %s", chn_id, out_path)
-
-    return result
 
 
 # merge baseline?
@@ -283,131 +238,6 @@ def _build_hist(
         range=(mean - range_multiplier * stdev, mean + range_multiplier * stdev),
     )
 
-def _write_column(result: dict, out_path: str | Path) -> bool:
-    """Write a cross-talk column to *out_path* as one lh5 table.
-
-    Both :func:`xtalk_column` and :func:`xtalk_histogram_fitter` write
-    through here, so the two steps produce the same kind of file and a key
-    added to either result dict reaches the file without further work.  The
-    mapping is by shape: a ``(N,)`` array becomes a column, a ``(N, m)``
-    array an ``ArrayOfEqualSizedArrays`` column, and anything else an
-    attribute on the table -- ``dict`` and ``list`` values as JSON strings,
-    which ``json_attrs`` then names so :func:`read_xtalk_column` knows to
-    decode them.
-
-    An existing *out_path* is replaced rather than appended to, which is what
-    lets the fitter write its results back over the file it read the
-    histograms from instead of spreading one column over two files.
-
-    Returns
-    -------
-    bool
-        False when the channel ids are not integral -- lh5 has no array type
-        for those, so nothing is written and a warning is logged.  The
-        caller still has its result in memory.
-    """
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    trigger_detector_id = result["trigger_id"]
-    try:
-        trigger_id = int(trigger_detector_id)
-        response_ids = np.array(
-            [int(i) for i in result["response_ids"]], dtype=np.int64
-        )
-    except (TypeError, ValueError) as e:
-        log.warning(
-            "xtalk column of trigger %s not written to %s: channel ids are "
-            "not integral, so lh5 cannot store them (%s)",
-            trigger_detector_id,
-            out_path,
-            e,
-        )
-        return False
-
-    col_dict = {"response_ids": lgdo.Array(response_ids)}
-    attrs = {"trigger_id": trigger_id}
-    json_attrs = []
-
-    for key, value in result.items():
-        if key in ("trigger_id", "response_ids"):
-            continue
-        if isinstance(value, np.ndarray) and value.ndim == 1:
-            col_dict[key] = lgdo.Array(value)
-        elif isinstance(value, np.ndarray) and value.ndim == 2:
-            col_dict[key] = lgdo.ArrayOfEqualSizedArrays(nda=value)
-        elif isinstance(value, (str, int, float)):
-            attrs[key] = value
-        else:
-            attrs[key] = json.dumps(value)
-            json_attrs.append(key)
-
-    attrs["json_attrs"] = json.dumps(sorted(json_attrs))
-
-    if out_path.exists():
-        log.info("replacing the existing %s", out_path)
-
-    lh5.write(
-        lgdo.Table(col_dict=col_dict, attrs=attrs),
-        name=f"ch{trigger_id}/xtalk_column",
-        lh5_file=out_path,
-        wo_mode="overwrite_file",
-        compression="gzip",
-    )
-    return True
-
-
-def read_xtalk_column(
-    in_path: str | Path, trigger_detector_id: str | int | None = None
-) -> dict:
-    """Read a file written by :func:`_write_column` back into its result dict.
-
-    The inverse of the writer, so a column filled in one job can be fitted in
-    another -- or refitted with different thresholds -- without refilling the
-    histograms.
-
-    Parameters
-    ----------
-    in_path
-        ``.lh5`` file written by :func:`xtalk_column` or
-        :func:`xtalk_histogram_fitter`.
-    trigger_detector_id
-        Which column to read, when the file holds more than one.  ``None``
-        reads the only one there.
-
-    Returns
-    -------
-    dict
-        The result dict the writer was given, with every array back as a
-        numpy array.  Channel ids come back as ``int64`` even if the caller
-        that wrote them had strings.
-    """
-    in_path = Path(in_path)
-
-    if trigger_detector_id is None:
-        groups = [g for g in lh5.ls(in_path) if g.startswith("ch")]
-        if len(groups) != 1:
-            msg = (
-                f"{in_path} holds {len(groups)} columns, name the trigger "
-                f"detector explicitly"
-            )
-            raise ValueError(msg)
-        group = groups[0]
-    else:
-        group = f"ch{trigger_detector_id}"
-
-    table = lh5.read(f"{group}/xtalk_column", in_path)
-
-    result = {key: table[key].nda for key in table.keys()}
-
-    json_attrs = set(json.loads(table.attrs.get("json_attrs", "[]")))
-    for key, value in table.attrs.items():
-        if key in ("datatype", "json_attrs"):
-            continue
-        result[key] = json.loads(value) if key in json_attrs else value
-
-    return result
-
 
 def xtalk_column(
     hit_files: str | list,
@@ -415,7 +245,6 @@ def xtalk_column(
     trigger_detector_id: str | int,
     baseline: dict,
     config: dict | None = None,
-    out_path: str | Path | None = None,
     debug_mode: bool = False,
 ) -> dict:
     """Fill the histograms for one column of the cross-talk matrix.
@@ -486,12 +315,6 @@ def xtalk_column(
         ``range_multiplier``
             Histogram half-width in standard deviations about the mean.
             Default 3.
-    out_path
-        ``.lh5`` file to write the column to; parent directories are
-        created.  An existing file is replaced.  ``None`` computes the
-        result and returns it without writing, as does a *baseline* whose
-        channel ids are not integral -- lh5 has no array type for those, so
-        the column is returned with a warning and no file.
     debug_mode
         If True, re-raise instead of falling back to an empty column or an
         empty element.
@@ -503,15 +326,8 @@ def xtalk_column(
         ``n_events`` ``(N,)``, ``neg_counts``/``pos_counts`` ``(N, nbins)``,
         ``neg_bins``/``pos_bins`` ``(N, nbins + 1)``, ``parameters`` and
         ``processed_at``.  Bins are NaN wherever the histogram is empty.
-
-        The lh5 file holds the same arrays, under the same names, as the
-        columns of a single table at ``ch{trigger_detector_id}/xtalk_column``
-        -- one row per matrix element.  ``trigger_id``, ``processed_at`` and
-        ``parameters`` describe the column as a whole rather than any one
-        element, so they are written as attributes on that table, the
-        latter as a JSON string.
     """
-    
+
     config = config or {}
     energy_param = config.get("energy_param", DEFAULT_ENERGY_PARAM)
     trigger_param = config.get("trigger_param", DEFAULT_TRIGGER_PARAM)
@@ -527,10 +343,6 @@ def xtalk_column(
     )
     nbins = int(config.get("nbins", DEFAULT_NBINS))
     range_multiplier = float(config.get("range_multiplier", DEFAULT_RANGE_MULTIPLIER))
-
-    out_path = Path(out_path) if out_path is not None else None
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
 
     chn_id_list = list(baseline.keys())
     n_response = len(chn_id_list)
@@ -687,7 +499,14 @@ def xtalk_column(
         "n_dsp_files": 1 if isinstance(dsp_files, str) else len(dsp_files),
     }
 
-    result = {
+    log.info(
+        "xtalk column of trigger %s filled, %s/%s elements",
+        trigger_detector_id,
+        int(valid.sum()),
+        n_response,
+    )
+
+    return {
         "trigger_id": trigger_detector_id,
         "response_ids": np.asarray(chn_id_list),
         "valid": valid,
@@ -700,16 +519,6 @@ def xtalk_column(
         "processed_at": datetime.now().isoformat(),
     }
 
-    if out_path is not None and _write_column(result, out_path):
-        log.info(
-            "xtalk column of trigger %s (%s/%s elements filled) written to %s",
-            trigger_detector_id,
-            int(valid.sum()),
-            n_response,
-            out_path,
-        )
-
-    return result
 
 def _gaussian(x: np.ndarray, amplitude: float, mu: float, sigma: float):
     """Unnormalised gaussian, the shape every cross-talk histogram is fitted with."""
@@ -780,14 +589,13 @@ def _fit_one_histogram(
 def xtalk_histogram_fitter(
     histogram_data: dict,
     config: dict | None = None,
-    out_path: str | Path | None = None,
     debug_mode: bool = False,
 ) -> dict:
     """Fit a gaussian to every histogram of one cross-talk column.
 
-    *histogram_data* is the dict :func:`xtalk_column` returns. The 
-    result in previous function is written out and read back here so 
-    that we could refit the histograms without refilling.  
+    *histogram_data* is the dict :func:`xtalk_column` returns.  Keeping the
+    two steps apart is what lets a column be refitted with different
+    thresholds without refilling its histograms.
 
     Every element is fitted twice, once against the negative and once against
     the positive response, and each fit lands in one of the outcomes of
@@ -823,9 +631,6 @@ def xtalk_histogram_fitter(
             fitting.  Default 0.05.
         ``sharp_fit_min_points``
             Bins that mask must leave for the fit to use it.  Default 5.
-    out_path
-        ``.lh5`` file to write to; if the file exists it is replaced. 
-        ``None`` computes the result and returns it without writing.
     debug_mode
         If True, re-raise instead of recording an element as ``fit_failed``.
 
@@ -908,23 +713,20 @@ def xtalk_histogram_fitter(
     result["fit_status_codes"] = FIT_STATUS
     result["fitted_at"] = datetime.now().isoformat()
 
-    if out_path is not None and _write_column(result, out_path):
-        log.info(
-            "xtalk fits of trigger %s (%s negative, %s positive of %s elements "
-            "converged) written to %s",
-            trigger_id,
-            int(result["neg_success"].sum()),
-            int(result["pos_success"].sum()),
-            n_response,
-            out_path,
-        )
+    log.info(
+        "xtalk fits of trigger %s: %s negative and %s positive of %s elements "
+        "converged",
+        trigger_id,
+        int(result["neg_success"].sum()),
+        int(result["pos_success"].sum()),
+        n_response,
+    )
 
     return result
 
 
 def build_xtalk_matrix(
     fitted_columns: dict,
-    out_path: str | Path | None = None,
     config: dict | None = None,
 ) -> XTCMatrix:
     """Assemble the fitted columns of a cross-talk matrix into the matrix.
@@ -947,10 +749,6 @@ def build_xtalk_matrix(
     fitted_columns
         Result dicts of :func:`xtalk_histogram_fitter`, keyed by trigger
         channel id.
-    out_path
-        ``.lh5`` file to write the matrix to; parent directories are created
-        and an existing file is replaced.  ``None`` builds the matrix and
-        returns it without writing.
     config
         Recognised keys, all optional:
 
@@ -960,23 +758,16 @@ def build_xtalk_matrix(
             is a quality cut.  Default ``FIT_STATUS["low_stats"]``, which
             keeps the moments of a sparse histogram, as the production files
             do, and drops everything that has no position to report anyway.
-        ``group``
-            Table name inside the file.  Default ``"xtc"``.
-        ``store_in_percent``
-            Whether to store percent in the file rather than the fractions
-            :func:`~pygama.pargen.xtc_utils.xtalk_element` produces.  Default
-            False.
 
     Returns
     -------
     XTCMatrix
-        Both matrices, their fit widths and their per-element status, always
-        as fractions whatever unit the file ends up in.
+        Both matrices, their fit widths and their per-element status, as
+        fractions.  :meth:`~pygama.pargen.xtc_utils.XTCMatrix.write_lh5`
+        puts them in a file when a caller wants one.
     """
     config = config or {}
     max_status = int(config.get("max_status", FIT_STATUS["low_stats"]))
-    group = config.get("group", "xtc")
-    store_in_percent = bool(config.get("store_in_percent", False))
 
     columns = {int(trigger_id): column for trigger_id, column in fitted_columns.items()}
     rawids = None
@@ -1043,8 +834,5 @@ def build_xtalk_matrix(
             missing,
             n_detectors,
         )
-
-    if out_path is not None:
-        matrix.write_lh5(out_path, group=group, store_in_percent=store_in_percent)
 
     return matrix

@@ -13,6 +13,11 @@ same process that produced its rows.
 The fitted columns are written to ``--out_dir`` rather than back over the
 histograms in ``--in_dir``, so a refit with different thresholds never costs
 another pass over the hit/dsp files.
+
+Neither pygama routine touches the disk: the columns are read with
+:func:`reproduce_utils.read_xtalk_column`, the fits written back with
+:func:`reproduce_utils.write_xtalk_column`, and the matrix put in its lh5 file
+by :meth:`~pygama.pargen.xtc_utils.XTCMatrix.write_lh5` here.
 """
 
 import argparse
@@ -22,11 +27,11 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from reproduce_utils import read_xtalk_column, write_xtalk_column
 
 from pygama.pargen.xtc import (
     FIT_STATUS,
     build_xtalk_matrix,
-    read_xtalk_column,
     xtalk_histogram_fitter,
 )
 
@@ -140,9 +145,9 @@ for column_file in column_files:
     result = xtalk_histogram_fitter(
         histogram_data,
         config=fit_config,
-        out_path=out_file,
         debug_mode=args.debug_mode,
     )
+    write_xtalk_column(result, out_file)
 
     trigger_id = int(result["trigger_id"])
     if trigger_id in fitted_columns:
@@ -172,12 +177,9 @@ matrix_file = args.results_dir / "par_evt_xtc.lh5"
 
 matrix = build_xtalk_matrix(
     fitted_columns,
-    out_path=matrix_file,
-    config={
-        "max_status": FIT_STATUS[args.max_status],
-        "store_in_percent": args.store_in_percent,
-    },
+    config={"max_status": FIT_STATUS[args.max_status]},
 )
+matrix.write_lh5(matrix_file, store_in_percent=args.store_in_percent)
 
 unit = "percent" if args.store_in_percent else "fractions"
 print(

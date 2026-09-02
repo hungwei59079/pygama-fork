@@ -15,7 +15,6 @@
 
 OUT_PATH=${OUT_PATH:-/pscratch/sd/h/hungwei/reproduce_temp/}
 FILE_LIST=${FILE_LIST:-reproduce/test_p08.json}
-DISPLAY_LEVEL=${DISPLAY_LEVEL:-0}
 
 # Always work from the repository root
 REPO_ROOT=${SLURM_SUBMIT_DIR:-$(dirname "$(dirname "$(readlink -f "$0")")")}
@@ -32,7 +31,6 @@ echo "Running prepare_baseline on detector ${SLURM_ARRAY_TASK_ID}, file list ${F
 python reproduce/prepare_baseline_p08.py \
     --file_list "${FILE_LIST}" \
     --out_path "${OUT_PATH}" \
-    --display "${DISPLAY_LEVEL}" \
     "${SLURM_ARRAY_TASK_ID}"
 
 echo "Done."

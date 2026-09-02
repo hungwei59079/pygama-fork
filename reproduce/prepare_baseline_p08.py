@@ -2,11 +2,17 @@
 
 One detector per invocation, picked by index into the ``chn_id`` list of
 ``test_p08.json``, so a SLURM array can cover all of them.
+
+``prepare_baseline`` only computes; the result is put on disk here, by
+:func:`reproduce_utils.write_baseline`, so that ``xtalk_column_p08.py`` can
+collect all 101 of them in a later job.
 """
 
 import argparse
 import json
 from pathlib import Path
+
+from reproduce_utils import write_baseline
 
 from pygama.pargen.xtc import prepare_baseline
 
@@ -31,12 +37,6 @@ parser.add_argument(
     type=Path,
     default=DEFAULT_OUT_PATH,
     help="Directory the per-detector baseline JSON is written to.",
-)
-parser.add_argument(
-    "--display",
-    type=int,
-    default=0,
-    help="If > 0, write the before/after selection histograms next to the JSON.",
 )
 parser.add_argument(
     "--debug_mode",
@@ -73,11 +73,11 @@ result = prepare_baseline(
     hit_files=hit_files,
     dsp_files=dsp_files,
     chn_id=detector,
-    out_path=out_file,
     config=config,
-    display=args.display,
     debug_mode=args.debug_mode,
 )
+
+write_baseline(result, out_file)
 
 print(f"result: {result}")
 print(f"written to: {out_file}")

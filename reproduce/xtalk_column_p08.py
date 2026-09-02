@@ -8,6 +8,10 @@ from ``--baseline_dir`` and collected into the ``baseline`` dict
 :func:`xtalk_column` expects.  They are collected in ``chn_id`` order, which is
 what makes every column cover the same detectors in the same order -- the
 condition :func:`~pygama.pargen.xtc.build_xtalk_matrix` checks later.
+
+``xtalk_column`` only fills the histograms; they are put on disk here, by
+:func:`reproduce_utils.write_xtalk_column`, so that ``fit_xtalk_p08.py`` can
+fit them in a later job without refilling.
 """
 
 import argparse
@@ -15,6 +19,8 @@ import json
 import logging
 import sys
 from pathlib import Path
+
+from reproduce_utils import load_baseline_in_order, write_xtalk_column
 
 from pygama.pargen.xtc import xtalk_column
 
@@ -81,31 +87,7 @@ if not 0 <= args.trigger_index < len(chn_id):
 trigger = chn_id[args.trigger_index]
 baseline_dir = args.baseline_dir or (args.out_path / "baseline")
 
-# Collect the baselines in chn_id order: the keys of this dict become the
-# response list of the column, so every column has to build it the same way.
-# A channel whose baseline is missing stays in the dict with None values, which
-# is what xtalk_column reads as "skip this element" while keeping the column
-# the same length as every other one.
-baseline = {}
-missing = []
-for index, detector in enumerate(chn_id):
-    baseline_file = baseline_dir / f"baseline_{index:04d}.json"
-    try:
-        with baseline_file.open() as f:
-            entry = json.load(f)
-    except FileNotFoundError:
-        missing.append(detector)
-        baseline[detector] = {"positive_baseline": None, "negative_baseline": None}
-        continue
-
-    if entry["detector_id"] != detector:
-        msg = (
-            f"{baseline_file} holds detector {entry['detector_id']}, but index "
-            f"{index} of {args.file_list} is detector {detector}"
-        )
-        raise ValueError(msg)
-
-    baseline[detector] = entry
+baseline, missing = load_baseline_in_order(baseline_dir, chn_id, args.file_list)
 
 unusable = [
     detector
@@ -143,13 +125,18 @@ result = xtalk_column(
     trigger_detector_id=trigger,
     baseline=baseline,
     config=config,
-    out_path=out_file,
     debug_mode=args.debug_mode,
 )
+
+written = write_xtalk_column(result, out_file)
 
 n_valid = int(result["valid"].sum())
 print(
     f"trigger ch{trigger}: {n_valid}/{len(result['response_ids'])} elements filled, "
     f"{int(result['n_events'].sum())} events over the whole column"
 )
-print(f"written to: {out_file}")
+print(
+    f"written to: {out_file}"
+    if written
+    else "not written: the channel ids are not integral, see the warning above"
+)
