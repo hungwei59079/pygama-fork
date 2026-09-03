@@ -15,7 +15,9 @@ import lh5
 import numpy as np
 from scipy.optimize import curve_fit
 
-from pygama.pargen.xtc_utils import EventSelector, XTCMatrix, xtalk_element
+import pygama.math.histogram as pgh
+from pygama.math.functions.gauss import nb_gauss_amp
+from pygama.pargen.xtc_utils import EventSelector, XTCMatrix
 
 log = logging.getLogger(__name__)
 
@@ -174,8 +176,6 @@ def prepare_baseline(
             "energy_param": energy_param,
             "positive_param": positive_param,
             "negative_param": negative_param,
-            "n_hit_files": 1 if isinstance(hit_files, str) else len(hit_files),
-            "n_dsp_files": 1 if isinstance(dsp_files, str) else len(dsp_files),
         },
     }
 
@@ -420,20 +420,12 @@ def xtalk_column(
                     idx=coincident_idxs,
                 )
 
-                neg_vals = np.asarray(
-                    xtalk_element(
-                        trigger_energies,
-                        response_table[negative_param].nda,
-                        negative_baseline,
-                    )
-                )
-                pos_vals = np.asarray(
-                    xtalk_element(
-                        trigger_energies,
-                        response_table[positive_param].nda,
-                        positive_baseline,
-                    )
-                )
+                neg_vals = (
+                    response_table[negative_param].nda - negative_baseline
+                ) / trigger_energies
+                pos_vals = (
+                    response_table[positive_param].nda - positive_baseline
+                ) / trigger_energies
             except Exception as e:
                 if debug_mode:
                     raise
@@ -479,8 +471,6 @@ def xtalk_column(
         "response_energy_range": list(response_energy_range),
         "nbins": nbins,
         "range_multiplier": range_multiplier,
-        "n_hit_files": 1 if isinstance(hit_files, str) else len(hit_files),
-        "n_dsp_files": 1 if isinstance(dsp_files, str) else len(dsp_files),
     }
 
     log.info(
@@ -504,12 +494,7 @@ def xtalk_column(
     }
 
 
-def _gaussian(x: np.ndarray, amplitude: float, mu: float, sigma: float):
-    """Unnormalised gaussian, the shape every cross-talk histogram is fitted with."""
-    return amplitude * np.exp(-((x - mu) ** 2) / (2 * sigma**2))
-
-
-def _fit_one_histogram(
+def _fit_gaussian_with_fallbacks(
     counts: np.ndarray,
     bins: np.ndarray,
     low_stats_threshold: float,
@@ -528,7 +513,7 @@ def _fit_one_histogram(
     if total_counts == 0:
         return np.nan, np.nan, np.nan, 0, FIT_STATUS["no_stats"]
 
-    x = 0.5 * (bins[1:] + bins[:-1])
+    x = pgh.get_bin_centers(bins)
 
     # too few counts, fallback to histogram arithmetic mean 
     if total_counts < low_stats_threshold:
@@ -554,12 +539,12 @@ def _fit_one_histogram(
         sigma_0 = float(x[1] - x[0]) if len(x) > 1 else 1.0 # Prevent ZeroDivisionError
 
     try:
-        popt, _ = curve_fit(_gaussian, x_fit, y_fit, p0=[amplitude_0, mu_0, sigma_0])
+        popt, _ = curve_fit(nb_gauss_amp, x_fit, y_fit, p0=[mu_0, sigma_0, amplitude_0])
     except (RuntimeError, ValueError) as e:
         log.debug("gaussian fit did not converge: %s", e)
         return np.nan, np.nan, np.nan, total_counts, FIT_STATUS["fit_failed"]
 
-    amplitude, mu, sigma = (float(v) for v in popt)
+    mu, sigma, amplitude = (float(v) for v in popt)
     return amplitude, mu, abs(sigma), total_counts, status
 
 
@@ -651,7 +636,7 @@ def xtalk_histogram_fitter(
                 continue
 
             try:
-                fit = _fit_one_histogram(
+                fit = _fit_gaussian_with_fallbacks(
                     counts[k],
                     bins[k],
                     low_stats_threshold,

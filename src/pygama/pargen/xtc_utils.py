@@ -172,56 +172,6 @@ class EventSelector:
         plt.close()
 
 
-def xtalk_element(
-    e_trig: np.ndarray | float,
-    e_response: np.ndarray | float,
-    baseline_value: float,
-) -> np.ndarray | float:
-    """Cross-talk of a response channel relative to its trigger, as a fraction.
-
-    The response amplitude has its baseline removed and is expressed as a
-    fraction of the trigger energy::
-
-        (e_response - baseline_value) / e_trig
-
-    Parameters
-    ----------
-    e_trig
-        Trigger-channel energy.  Array, or a single value.
-    e_response
-        Response-channel amplitude at the same events.  Must match the type
-        and length of *e_trig*.
-    baseline_value
-        Baseline of the response channel, subtracted from *e_response*.
-
-    Returns
-    -------
-    Fractional cross-talk, elementwise when the inputs are arrays.  Multiply
-    by 100 for percent; nothing downstream does that for you, and
-    :meth:`XTCMatrix.write_lh5` only does it when asked.
-    """
-    if not isinstance(baseline_value, (int, float, np.integer, np.floating)):
-        msg = "baseline_value must be a numerical type (int or float)."
-        raise TypeError(msg)
-
-    if isinstance(e_trig, np.ndarray) and isinstance(e_response, np.ndarray):
-        if len(e_trig) != len(e_response):
-            msg = "e_trig and e_response must have the same length."
-            raise ValueError(msg)
-        return (e_response - baseline_value) / e_trig
-
-    if isinstance(e_trig, (int, float, np.integer, np.floating)) and isinstance(
-        e_response, (int, float, np.integer, np.floating)
-    ):
-        return (e_response - baseline_value) / e_trig
-
-    msg = (
-        "e_trig and e_response must either both be arrays of equal length "
-        "or both be numerical values."
-    )
-    raise TypeError(msg)
-
-
 class XTCMatrix:
     """The cross-talk matrices of one set of detectors, both polarities.
 
@@ -229,11 +179,10 @@ class XTCMatrix:
     when detector ``rawids[j1]`` triggered, so rows are triggers and columns
     are responses.  The diagonal, and any pair that was never fitted, is NaN.
 
-    Values are held as **fractions**, the unit
-    :func:`~pygama.pargen.xtc_utils.xtalk_element` produces and the one the
-    production xtc files store.  :meth:`write_lh5` can be asked to store
-    percent instead, and records that choice in the file so
-    :meth:`read_lh5` restores fractions without being told.
+    Values are held as **fractions**, the unit the production xtc files
+    store.  :meth:`write_lh5` can be asked to store percent instead, and
+    records that choice in the file so :meth:`read_lh5` restores fractions
+    without being told.
 
     Parameters
     ----------
