@@ -3,21 +3,26 @@ This module provides routines for measuring cross-talk (XTC) between
 germanium channels and for building the resulting cross-talk matrix.
 
 The four main functions, in order of execution, are:
-prepare_baseline, xtalk_column, xtalk_histogram_fitter, and build_xtalk_matrix. 
+prepare_baseline, xtalk_column, xtalk_histogram_fitter, and build_xtalk_matrix.
+
+:func:`plot_xtalk_matrix` draws what the last of them returns.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 
+import lgdo
 import lh5
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.optimize import curve_fit
 
 import pygama.math.histogram as pgh
 from pygama.math.functions.gauss import nb_gauss_amp
-from pygama.pargen.xtc_utils import EventSelector, XTCMatrix
+from pygama.pargen.xtc_utils import EventSelector
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +52,11 @@ FIT_STATUS = {
 
 #: Statuses whose ``mu`` and ``sigma`` come from a converged fit.
 FIT_STATUS_SUCCESS = (FIT_STATUS["ok"], FIT_STATUS["ok_few_points"])
+
+#: Column each polarity is stored under in an xtc lh5 file.  
+XTC_LH5_FIELD = {"neg": "xtalk_matrix_negative", "pos": "xtalk_matrix_positive"}
+
+XTC_PLOT_RANGE = {"neg": (-0.003, 0.001), "pos": (-0.0007, 0.003)}
 
 
 def prepare_baseline(
@@ -688,8 +698,11 @@ def xtalk_histogram_fitter(
 def build_xtalk_matrix(
     fitted_columns: dict,
     config: dict | None = None,
-) -> XTCMatrix:
+) -> lgdo.Table:
     """Assemble the fitted columns of a cross-talk matrix into the matrix.
+
+    Element ``[j1, j2]`` of a matrix:  ``rawid_index[j1]`` represents triggered 
+    detector, while ``rawid_index[j2]`` represents the responding detector.  
 
     Parameters
     ----------
@@ -700,15 +713,26 @@ def build_xtalk_matrix(
         Recognised keys, all optional:
 
         ``max_status``
-            Highest :data:`FIT_STATUS` code to accept into the matrix. Default 
+            Highest :data:`FIT_STATUS` code to accept into the matrix. Default
             ``FIT_STATUS["low_stats"]``.
 
     Returns
     -------
-    XTCMatrix
-        Both matrices, their fit widths and their per-element status, as
-        fractions.  :meth:`~pygama.pargen.xtc_utils.XTCMatrix.write_lh5`
-        puts them in a file when a caller wants one.
+    lgdo.Table
+        A table with the following fields. Values are sorted in the order of 
+        ``rawid_index``:
+
+        ``rawid_index`` ``(N,)``
+            Detector ids: ``rawid_index[j]`` is the detector at row and
+            column ``j`` of every matrix.
+        ``xtalk_matrix_negative``, ``xtalk_matrix_positive`` ``(N, N)``
+            The fitted peak positions, as **fractions**, which is the unit
+            the production files store.
+        ``..._sigma`` ``(N, N)``
+            The width of each of those fits, also as fractions.
+        ``..._status`` ``(N, N)``
+            The :data:`FIT_STATUS` code of each element, meaning explained in 
+            :func:`xtalk_histogram_fitter`. 
     """
     config = config or {}
     max_status = int(config.get("max_status", FIT_STATUS["low_stats"]))
@@ -746,16 +770,16 @@ def build_xtalk_matrix(
 
     n_detectors = len(rawids)
     shape = (n_detectors, n_detectors)
-    mu = {p: np.full(shape, np.nan) for p in XTCMatrix.polarities}
-    sigma = {p: np.full(shape, np.nan) for p in XTCMatrix.polarities}
+    mu = {p: np.full(shape, np.nan) for p in ("neg", "pos")}
+    sigma = {p: np.full(shape, np.nan) for p in ("neg", "pos")}
     status = {
         p: np.full(shape, FIT_STATUS["not_filled"], dtype=np.int8)
-        for p in XTCMatrix.polarities
+        for p in ("neg", "pos")
     }
 
     for trigger_id, column in columns.items():
         row = index_of[trigger_id]
-        for polarity in XTCMatrix.polarities:
+        for polarity in ("neg", "pos"):
             column_status = np.asarray(column[f"{polarity}_status"], dtype=np.int8)
             accepted = column_status <= max_status
 
@@ -767,9 +791,12 @@ def build_xtalk_matrix(
                 accepted, np.asarray(column[f"{polarity}_sigma"], dtype=float), np.nan
             )
 
-    matrix = XTCMatrix(
-        rawids, mu=mu, sigma=sigma, status=status, status_codes=FIT_STATUS
-    )
+    col_dict = {"rawid_index": lgdo.Array(np.asarray(rawids, dtype=np.int64))}
+    for polarity in ("neg", "pos"):
+        field = XTC_LH5_FIELD[polarity]
+        col_dict[field] = lgdo.Array(mu[polarity])
+        col_dict[f"{field}_sigma"] = lgdo.Array(sigma[polarity])
+        col_dict[f"{field}_status"] = lgdo.Array(status[polarity])
 
     missing = n_detectors - len(columns)
     if missing:
@@ -779,4 +806,68 @@ def build_xtalk_matrix(
             n_detectors,
         )
 
-    return matrix
+    return lgdo.Table(
+        col_dict=col_dict, attrs={"fit_status_codes": json.dumps(FIT_STATUS)}
+    )
+
+
+def plot_xtalk_matrix(
+    matrix: lgdo.Table,
+    polarity: str = "neg",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    cmap=None,
+    title: str | None = None,
+    figsize: tuple = (8, 6),
+) -> plt.Figure:
+    """Draw a heatmap of one polarity of a cross-talk matrix.
+
+    Parameters
+    ----------
+    matrix
+        Table :func:`build_xtalk_matrix` returned, or one read back from an
+        xtc lh5 file with :func:`lh5.read`.  Only the polarity's own column
+        is used, so a production file that carries nothing but the two
+        matrices plots as well as one this module wrote.
+    polarity
+        ``"neg"`` or ``"pos"``, naming the column through
+        :data:`XTC_LH5_FIELD`.
+    vmin, vmax
+        Colour-scale limits, as fractions.  ``None`` takes the polarity's
+        entry in :data:`XTC_PLOT_RANGE`.
+    cmap
+        Colormap, defaulting to reversed jet as in the original analysis.
+    title
+        Figure title.  ``None`` names the polarity.
+    figsize
+        Figure size, in inches.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure, for the caller to show or to ``savefig``.
+    """
+    if polarity not in XTC_LH5_FIELD:
+        msg = f"polarity must be one of {tuple(XTC_LH5_FIELD)}, got {polarity!r}"
+        raise ValueError(msg)
+
+    values = matrix[XTC_LH5_FIELD[polarity]]
+    values = np.asarray(values.nda if hasattr(values, "nda") else values)
+
+    default_vmin, default_vmax = XTC_PLOT_RANGE[polarity]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    image = ax.imshow(
+        values,
+        origin="lower",
+        vmin=default_vmin if vmin is None else vmin,
+        vmax=default_vmax if vmax is None else vmax,
+        cmap=plt.cm.jet_r if cmap is None else cmap,
+    )
+    fig.colorbar(image, ax=ax, label="Cross-talk (fraction)")
+    ax.set_xlabel("Response channel index")
+    ax.set_ylabel("Trigger channel index")
+    ax.set_title(title if title is not None else f"{polarity} cross-talk matrix")
+    fig.tight_layout()
+
+    return fig
