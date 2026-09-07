@@ -3,7 +3,7 @@
 The two steps after ``xtalk_column_p08.py``, in one job:
 :func:`~pygama.pargen.xtc.xtalk_histogram_fitter` runs over every column file
 in ``--in_dir``, then :func:`~pygama.pargen.xtc.build_xtalk_matrix` collects
-what it returned into an :class:`~pygama.pargen.xtc_utils.XTCMatrix`.
+what it returned into an :class:`lgdo.Table`.
 
 Fitting a column is fast enough -- a few thousand gaussians, no file reading
 beyond the histograms themselves -- that all 101 of them fit in one serial
@@ -17,7 +17,7 @@ another pass over the hit/dsp files.
 Neither pygama routine touches the disk: the columns are read with
 :func:`reproduce_utils.read_xtalk_column`, the fits written back with
 :func:`reproduce_utils.write_xtalk_column`, and the matrix put in its lh5 file
-by :meth:`~pygama.pargen.xtc_utils.XTCMatrix.write_lh5` here.
+here.
 """
 
 import argparse
