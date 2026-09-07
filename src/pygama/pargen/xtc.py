@@ -68,14 +68,8 @@ def _selection_mask(
     conditions: dict | None = None,
     energy_range: tuple | None = None,
 ) -> np.ndarray:
-    """Rows of *table* that survive the event cuts, as a boolean mask.
-
-    Keeps the rows whose *ene_field* is not NaN, whose flag fields equal the
-    values named in *conditions*, and whose *ene_field* falls inside
-    *energy_range* inclusive.  ``None`` for either applies no such cut.
-
-    *table* is any lgdo table, so the same cuts serve a whole read and one
-    chunk of an :class:`lh5.LH5Iterator` alike.
+    """
+    Rows of *table* that survive the event cuts, as a boolean mask.
     """
     energies = table[ene_field].nda
     mask = ~np.isnan(energies)
@@ -153,9 +147,6 @@ def prepare_baseline(
 
     try:
         try:
-            # one pass over both tiers: the dsp amplitudes ride along with the
-            # hit-tier flags they are selected by, so neither tier is ever
-            # held in full
             dsp_iterator = lh5.LH5Iterator(
                 dsp_files,
                 f"ch{chn_id}/dsp",
@@ -177,13 +168,10 @@ def prepare_baseline(
             for table in hit_iterator:
                 mask = _selection_mask(table, energy_param, conditions)
                 n_selected += int(mask.sum())
-
-                # the two amplitudes keep separate nan cuts, so a channel whose
-                # positive field is unusable still yields a negative baseline
                 positive = table[f"{positive_param}{_DSP_SUFFIX}"].nda[mask]
                 negative = table[f"{negative_param}{_DSP_SUFFIX}"].nda[mask]
-                positive_chunks.append(positive[~np.isnan(positive)])
-                negative_chunks.append(negative[~np.isnan(negative)])
+                positive_chunks.append(positive[np.isfinite(positive)])
+                negative_chunks.append(negative[np.isfinite(negative)])
         except Exception as e:
             msg = (
                 f"baseline selection on {energy_param} over "
@@ -199,7 +187,7 @@ def prepare_baseline(
         positive_selected = np.concatenate(positive_chunks)
         negative_selected = np.concatenate(negative_chunks)
         if len(positive_selected) == 0 or len(negative_selected) == 0:
-            msg = "no baseline events survived the dsp-tier nan cut"
+            msg = "no baseline events survived the dsp-tier non-finite cut"
             raise RuntimeError(msg)
 
         positive_baseline = float(np.mean(positive_selected))
@@ -247,7 +235,7 @@ def _resolve_baseline(baseline: dict, chn_id: str | int) -> tuple[float, float] 
 
     positive = float(positive)
     negative = float(negative)
-    if np.isnan(positive) or np.isnan(negative):
+    if not np.isfinite(positive) or not np.isfinite(negative):
         return None
 
     return positive, negative
@@ -260,12 +248,13 @@ def _build_hist(
 
     Returns ``None`` when the sample is empty or has no usable spread.
     """
+    vals = vals[np.isfinite(vals)]
     if vals.size == 0:
         return None
 
     mean = np.mean(vals)
     stdev = np.std(vals)
-    if np.isnan(mean) or np.isnan(stdev) or stdev <= 0:
+    if not np.isfinite(mean) or not np.isfinite(stdev) or stdev <= 0:
         return None
 
     return np.histogram(
@@ -297,7 +286,7 @@ def xtalk_column(
 
     Detector pairs skipped are recorded with ``valid = False`` and an empty
     histogram. This happens when the response channel is the trigger itself, or when
-    either channel has no usable baseline (missing, ``None`` or NaN).  If the
+    either channel has no usable baseline (missing, ``None`` or non-finite).  If the
     *trigger* channel has no usable baseline the whole column is skipped.
 
     Parameters
@@ -393,7 +382,7 @@ def xtalk_column(
     n_events = np.zeros(n_response, dtype=np.int64)
 
     trigger_idxs = None
-    trigger_energies_all = None
+    trigger_amplitudes_all = None
 
     # trigger selection. Only need to be done once per column.
     try:
@@ -401,9 +390,6 @@ def xtalk_column(
             msg = f"trigger channel {trigger_detector_id} has no usable baseline"
             raise RuntimeError(msg)
 
-        # one pass over both tiers, keeping only the rows that triggered: this
-        # is the work the whole column shares, and the only step whose cost
-        # grows with the number of events rather than with the selection
         try:
             dsp_iterator = lh5.LH5Iterator(
                 dsp_files,
@@ -421,13 +407,13 @@ def xtalk_column(
             )
 
             idx_chunks = []
-            energy_chunks = []
+            amplitude_chunks = []
             for table in hit_iterator:
                 mask = _selection_mask(
                     table, energy_param, trigger_conditions, trigger_energy_range
                 )
                 idx_chunks.append(hit_iterator.current_global_entries[mask])
-                energy_chunks.append(table[f"{trigger_param}{_DSP_SUFFIX}"].nda[mask])
+                amplitude_chunks.append(table[f"{trigger_param}{_DSP_SUFFIX}"].nda[mask])
         except Exception as e:
             msg = f"trigger event selection failed: {type(e).__name__}: {e}"
             raise RuntimeError(msg) from e
@@ -436,9 +422,20 @@ def xtalk_column(
             msg = "no events passed the trigger selection"
             raise RuntimeError(msg)
 
-        # current_global_entries is int32; lh5.read indexes with these later
         trigger_idxs = np.concatenate(idx_chunks).astype(np.int64)
-        trigger_energies_all = np.concatenate(energy_chunks)
+        trigger_amplitudes_all = np.concatenate(amplitude_chunks)
+
+        usable = np.isfinite(trigger_amplitudes_all) & (trigger_amplitudes_all != 0)
+        if not usable.all():
+            log.debug(
+                "trigger %s: dropping %d of %d events with a non-finite or zero %s",
+                trigger_detector_id,
+                int((~usable).sum()),
+                len(usable),
+                trigger_param,
+            )
+            trigger_idxs = trigger_idxs[usable]
+            trigger_amplitudes_all = trigger_amplitudes_all[usable]
 
         if len(trigger_idxs) == 0:
             msg = "no events passed the trigger selection"
@@ -472,8 +469,6 @@ def xtalk_column(
             positive_baseline, negative_baseline = baselines
 
             try:
-                # only the rows that triggered are read, so every read past
-                # the trigger pass is the size of the selection, not the run
                 response_hit = lh5.read(
                     f"ch{response_id}/hit/",
                     hit_files,
@@ -481,7 +476,6 @@ def xtalk_column(
                     idx=trigger_idxs,
                 )
 
-                # coincident rows, as positions within the trigger selection
                 keep = _selection_mask(
                     response_hit,
                     energy_param,
@@ -489,7 +483,7 @@ def xtalk_column(
                     response_energy_range,
                 )
                 coincident_idxs = trigger_idxs[keep]
-                trigger_energies = trigger_energies_all[keep]
+                trigger_amplitudes = trigger_amplitudes_all[keep]
 
                 response_dsp = lh5.read(
                     f"ch{response_id}/dsp/",
@@ -500,10 +494,10 @@ def xtalk_column(
 
                 neg_vals = (
                     response_dsp[negative_param].nda - negative_baseline
-                ) / trigger_energies
+                ) / trigger_amplitudes
                 pos_vals = (
                     response_dsp[positive_param].nda - positive_baseline
-                ) / trigger_energies
+                ) / trigger_amplitudes
             except Exception as e:
                 if debug_mode:
                     raise
@@ -516,7 +510,7 @@ def xtalk_column(
                 continue
 
             valid[k] = True
-            n_events[k] = len(trigger_energies)
+            n_events[k] = len(trigger_amplitudes)
 
             neg_hist = _build_hist(neg_vals, nbins, range_multiplier)
             if neg_hist is not None:
