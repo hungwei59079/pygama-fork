@@ -26,6 +26,8 @@ from pygama.math.functions.gauss import nb_gauss_amp
 log = logging.getLogger(__name__)
 
 DEFAULT_ENERGY_PARAM = "cuspEmax_ctc_cal"
+DEFAULT_BASELINE_CONDITIONS = {"is_empty_candidate": 63}
+DEFAULT_TRIGGER_CONDITIONS = {"is_highly_positive_polarity_candidate": 511}
 DEFAULT_POSITIVE_PARAM = "trapTmax"
 DEFAULT_NEGATIVE_PARAM = "trapTmin"
 DEFAULT_TRIGGER_PARAM = "trapTmax"
@@ -52,15 +54,10 @@ FIT_STATUS = {
     "no_stats": 4,
     "not_filled": 5,
 }
-
-#: Statuses whose ``mu`` and ``sigma`` come from a converged fit.
 FIT_STATUS_SUCCESS = (FIT_STATUS["ok"], FIT_STATUS["ok_few_points"])
 
-#: Column each polarity is stored under in an xtc lh5 file.  
 XTC_LH5_FIELD = {"neg": "xtalk_matrix_negative", "pos": "xtalk_matrix_positive"}
-
 XTC_PLOT_RANGE = {"neg": (-0.003, 0.001), "pos": (-0.0007, 0.003)}
-
 
 def _selection_mask(
     table,
@@ -89,6 +86,7 @@ def prepare_baseline(
     dsp_files: str | list,
     chn_id: str | int,
     config: dict | None = None,
+    buffer_len: int = DEFAULT_BUFFER_LEN,
     debug_mode: bool = False,
 ) -> dict:
     """Measure the positive and negative baselines of a single channel.
@@ -105,7 +103,7 @@ def prepare_baseline(
         DSP-tier file, or list of files, holding the amplitudes.  Must cover
         the same events, in the same order, as *hit_files*.
     chn_id
-        Channel identifier (rawid) of the detector, without the ``ch``
+        Channel identifier (rawid) of the detsector, without the ``ch``
         prefix.  Tables are read from ``ch{chn_id}/hit/`` and
         ``ch{chn_id}/dsp/``.
     config
@@ -113,17 +111,15 @@ def prepare_baseline(
 
         ``baseline_conditions``
             Mapping of hit-tier flag field to the value it must equal for an
-            event to count as baseline, e.g. ``{"is_empty_candidate": 63}``.
-            Defaults to ``{}``, i.e. no flag cut.
+            event to count as baseline.  Default ``{"is_empty_candidate": 63}``.
         ``energy_param``
             Hit-tier field the selection is applied to.  Default
             ``"cuspEmax_ctc_cal"``.
         ``positive_param``, ``negative_param``
             DSP-tier fields averaged to give the positive and negative
             baselines.  Default ``"trapTmax"`` and ``"trapTmin"``.
-        ``buffer_len``
-            Rows read per chunk, which is what bounds the memory this takes
-            however many events the files hold.  Default 100000.
+    buffer_len
+        Rows read per chunk.
     debug_mode
         If True, re-raise instead of falling back to a null result.
 
@@ -135,11 +131,10 @@ def prepare_baseline(
         and ``parameters``.
     """
     config = config or {}
-    conditions = config.get("baseline_conditions", {})
+    conditions = dict(config.get("baseline_conditions", DEFAULT_BASELINE_CONDITIONS))
     energy_param = config.get("energy_param", DEFAULT_ENERGY_PARAM)
     positive_param = config.get("positive_param", DEFAULT_POSITIVE_PARAM)
     negative_param = config.get("negative_param", DEFAULT_NEGATIVE_PARAM)
-    buffer_len = int(config.get("buffer_len", DEFAULT_BUFFER_LEN))
 
     success = True
     positive_baseline = None
@@ -270,6 +265,7 @@ def xtalk_column(
     trigger_detector_id: str | int,
     baseline: dict,
     config: dict | None = None,
+    buffer_len: int = DEFAULT_BUFFER_LEN,
     debug_mode: bool = False,
 ) -> dict:
     """Fill the histograms for one column of the cross-talk matrix.
@@ -324,9 +320,8 @@ def xtalk_column(
             negative baselines.  Default ``"trapTmax"`` and ``"trapTmin"``.
         ``trigger_conditions``, ``response_conditions``
             Mappings of hit-tier flag field to the value it must equal, for
-            the trigger and response selections respectively, e.g.
-            ``{"is_highly_positive_polarity_candidate": 511}``.  Default
-            ``{}``, i.e. no flag cut.
+            the trigger and response selections respectively.  Default
+            ``{"is_highly_positive_polarity_candidate": 511}`` and ``{}``.
         ``trigger_energy_range``
             ``(emin, emax)`` on ``energy_param`` selecting real triggers.
             Default ``(1500, 99999)``.
@@ -338,10 +333,8 @@ def xtalk_column(
         ``range_multiplier``
             Histogram half-width in standard deviations about the mean.
             Default 3.
-        ``buffer_len``
-            Rows read per chunk during the trigger selection, which is what
-            bounds the memory this takes however many events the files hold.
-            Default 100000.
+    buffer_len
+        Rows read per chunk during the trigger selection.
     debug_mode
         If True, re-raise instead of falling back to an empty column or an
         empty element.
@@ -360,7 +353,9 @@ def xtalk_column(
     trigger_param = config.get("trigger_param", DEFAULT_TRIGGER_PARAM)
     positive_param = config.get("positive_param", DEFAULT_POSITIVE_PARAM)
     negative_param = config.get("negative_param", DEFAULT_NEGATIVE_PARAM)
-    trigger_conditions = config.get("trigger_conditions", {})
+    trigger_conditions = dict(
+        config.get("trigger_conditions", DEFAULT_TRIGGER_CONDITIONS)
+    )
     response_conditions = config.get("response_conditions", {})
     trigger_energy_range = tuple(
         config.get("trigger_energy_range", DEFAULT_TRIGGER_ENERGY_RANGE)
@@ -370,7 +365,6 @@ def xtalk_column(
     )
     nbins = int(config.get("nbins", DEFAULT_NBINS))
     range_multiplier = float(config.get("range_multiplier", DEFAULT_RANGE_MULTIPLIER))
-    buffer_len = int(config.get("buffer_len", DEFAULT_BUFFER_LEN))
 
     chn_id_list = list(baseline.keys())
     n_response = len(chn_id_list)
