@@ -3,7 +3,15 @@ This module provides routines for measuring cross-talk (XTC) between
 germanium channels and for building the resulting cross-talk matrix.
 
 The four main functions, in order of execution, are:
-prepare_baseline, xtalk_column, xtalk_histogram_fitter, and build_xtalk_matrix.
+get_baseline_and_trigger_amps, xtalk_column, xtalk_histogram_fitter, and
+build_xtalk_matrix.
+
+A column of the matrix fixes the *responding* detector and runs over the
+triggers.  Everything a trigger detector contributes to every column -- the
+events it selected and the amplitude each of them fired with -- is measured
+once per channel by get_baseline_and_trigger_amps, in the same pass that
+measures that channel's baselines, so filling a column costs one pass over
+one channel rather than one pass per detector pair.
 
 :func:`plot_xtalk_matrix` draws what the last of them returns.
 """
@@ -81,7 +89,18 @@ def _selection_mask(
     return mask
 
 
-def prepare_baseline(
+def _usable_baseline(value) -> float | None:
+    """*value* as a float, or None when it is not a number to subtract."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def get_baseline_and_trigger_amps(
     hit_files: str | list,
     dsp_files: str | list,
     chn_id: str | int,
@@ -89,11 +108,23 @@ def prepare_baseline(
     buffer_len: int = DEFAULT_BUFFER_LEN,
     debug_mode: bool = False,
 ) -> dict:
-    """Measure the positive and negative baselines of a single channel.
+    """Measure the baselines of one channel and select the events it triggers.
 
-    Selects baseline events in the hit tier -- those whose flag fields match
-    ``config["baseline_conditions"]`` -- then averages the corresponding
-    positive- and negative-going DSP amplitudes over exactly those events.
+    Both products come out of a single pass over the channel because both are
+    per-channel quantities that every cross-talk column needs: the baselines
+    are subtracted when this channel responds, and the trigger events are the
+    ones every other channel is histogrammed over when this channel triggers.
+
+    The baseline half selects the events whose hit-tier flags match
+    ``config["baseline_conditions"]`` and averages the positive- and
+    negative-going DSP amplitudes over exactly those events.  The trigger half
+    selects the events whose flags match ``config["trigger_conditions"]`` and
+    whose energy falls inside ``config["trigger_energy_range"]``, and keeps
+    their global entry numbers together with the DSP amplitude
+    :func:`xtalk_column` divides by.
+
+    The two selections are independent: either can fail on its own, and each
+    reports its own flag.  A failure to read the channel at all fails both.
 
     Parameters
     ----------
@@ -103,7 +134,7 @@ def prepare_baseline(
         DSP-tier file, or list of files, holding the amplitudes.  Must cover
         the same events, in the same order, as *hit_files*.
     chn_id
-        Channel identifier (rawid) of the detsector, without the ``ch``
+        Channel identifier (rawid) of the detector, without the ``ch``
         prefix.  Tables are read from ``ch{chn_id}/hit/`` and
         ``ch{chn_id}/dsp/``.
     config
@@ -112,12 +143,22 @@ def prepare_baseline(
         ``baseline_conditions``
             Mapping of hit-tier flag field to the value it must equal for an
             event to count as baseline.  Default ``{"is_empty_candidate": 63}``.
+        ``trigger_conditions``
+            Mapping of hit-tier flag field to the value it must equal for an
+            event to count as a trigger.  Default
+            ``{"is_highly_positive_polarity_candidate": 511}``.
+        ``trigger_energy_range``
+            ``(emin, emax)`` on ``energy_param`` selecting real triggers.
+            Default ``(1500, 99999)``.
         ``energy_param``
-            Hit-tier field the selection is applied to.  Default
+            Hit-tier field both selections are applied to.  Default
             ``"cuspEmax_ctc_cal"``.
         ``positive_param``, ``negative_param``
             DSP-tier fields averaged to give the positive and negative
             baselines.  Default ``"trapTmax"`` and ``"trapTmin"``.
+        ``trigger_param``
+            DSP-tier field giving the trigger energy that ends up in the
+            denominator of the cross-talk ratio.  Default ``"trapTmax"``.
     buffer_len
         Rows read per chunk.
     debug_mode
@@ -127,113 +168,215 @@ def prepare_baseline(
     -------
     dict
         Keys ``detector_id``, ``positive_baseline``, ``negative_baseline``
-        (``None`` when the measurement failed), ``success``, ``processed_at``
-        and ``parameters``.
+        (``None`` when that measurement failed), ``trigger_idxs`` and
+        ``trigger_amplitudes`` (both empty when the trigger selection failed),
+        ``baseline_success``, ``trigger_success``, ``processed_at`` and
+        ``parameters``.
+
+    Notes
+    -----
+    ``trigger_idxs`` are global entry numbers into *hit_files* read as one
+    concatenated table, so they address a row of another channel correctly
+    only if that channel covers the same events in the same order.  That is
+    the same assumption :func:`xtalk_column` makes of the pair.
     """
     config = config or {}
-    conditions = dict(config.get("baseline_conditions", DEFAULT_BASELINE_CONDITIONS))
+    baseline_conditions = dict(
+        config.get("baseline_conditions", DEFAULT_BASELINE_CONDITIONS)
+    )
+    trigger_conditions = dict(
+        config.get("trigger_conditions", DEFAULT_TRIGGER_CONDITIONS)
+    )
+    trigger_energy_range = tuple(
+        config.get("trigger_energy_range", DEFAULT_TRIGGER_ENERGY_RANGE)
+    )
     energy_param = config.get("energy_param", DEFAULT_ENERGY_PARAM)
     positive_param = config.get("positive_param", DEFAULT_POSITIVE_PARAM)
     negative_param = config.get("negative_param", DEFAULT_NEGATIVE_PARAM)
+    trigger_param = config.get("trigger_param", DEFAULT_TRIGGER_PARAM)
 
-    success = True
+    # the three dsp fields and the flags of both selections are usually not
+    # three and two distinct fields, so read each of them only once
+    dsp_fields = list(dict.fromkeys([positive_param, negative_param, trigger_param]))
+    hit_fields = list(
+        dict.fromkeys([energy_param, *baseline_conditions, *trigger_conditions])
+    )
+
+    baseline_success = True
+    trigger_success = True
     positive_baseline = None
     negative_baseline = None
+    trigger_idxs = np.empty(0, dtype=np.int64)
+    trigger_amplitudes = np.empty(0)
 
+    n_baseline = 0
+    positive_chunks = []
+    negative_chunks = []
+    idx_chunks = []
+    amplitude_chunks = []
+
+    read_ok = True
     try:
-        try:
-            dsp_iterator = lh5.LH5Iterator(
-                dsp_files,
-                f"ch{chn_id}/dsp",
-                field_mask=[positive_param, negative_param],
-                buffer_len=buffer_len,
+        dsp_iterator = lh5.LH5Iterator(
+            dsp_files,
+            f"ch{chn_id}/dsp",
+            field_mask=dsp_fields,
+            buffer_len=buffer_len,
+        )
+        hit_iterator = lh5.LH5Iterator(
+            hit_files,
+            f"ch{chn_id}/hit",
+            field_mask=hit_fields,
+            buffer_len=buffer_len,
+            friend=dsp_iterator,
+            friend_suffix=_DSP_SUFFIX,
+        )
+
+        for table in hit_iterator:
+            baseline_mask = _selection_mask(table, energy_param, baseline_conditions)
+            n_baseline += int(baseline_mask.sum())
+            positive = table[f"{positive_param}{_DSP_SUFFIX}"].nda[baseline_mask]
+            negative = table[f"{negative_param}{_DSP_SUFFIX}"].nda[baseline_mask]
+            positive_chunks.append(positive[np.isfinite(positive)])
+            negative_chunks.append(negative[np.isfinite(negative)])
+
+            trigger_mask = _selection_mask(
+                table, energy_param, trigger_conditions, trigger_energy_range
             )
-            hit_iterator = lh5.LH5Iterator(
-                hit_files,
-                f"ch{chn_id}/hit",
-                field_mask=[energy_param, *conditions],
-                buffer_len=buffer_len,
-                friend=dsp_iterator,
-                friend_suffix=_DSP_SUFFIX,
+            idx_chunks.append(hit_iterator.current_global_entries[trigger_mask])
+            amplitude_chunks.append(
+                table[f"{trigger_param}{_DSP_SUFFIX}"].nda[trigger_mask]
             )
-
-            n_selected = 0
-            positive_chunks = []
-            negative_chunks = []
-            for table in hit_iterator:
-                mask = _selection_mask(table, energy_param, conditions)
-                n_selected += int(mask.sum())
-                positive = table[f"{positive_param}{_DSP_SUFFIX}"].nda[mask]
-                negative = table[f"{negative_param}{_DSP_SUFFIX}"].nda[mask]
-                positive_chunks.append(positive[np.isfinite(positive)])
-                negative_chunks.append(negative[np.isfinite(negative)])
-        except Exception as e:
-            msg = (
-                f"baseline selection on {energy_param} over "
-                f"{positive_param}/{negative_param} failed: "
-                f"{type(e).__name__}: {e}"
-            )
-            raise RuntimeError(msg) from e
-
-        if n_selected == 0:
-            msg = "no events passed the baseline selection"
-            raise RuntimeError(msg)
-
-        positive_selected = np.concatenate(positive_chunks)
-        negative_selected = np.concatenate(negative_chunks)
-        if len(positive_selected) == 0 or len(negative_selected) == 0:
-            msg = "no baseline events survived the dsp-tier non-finite cut"
-            raise RuntimeError(msg)
-
-        positive_baseline = float(np.mean(positive_selected))
-        negative_baseline = float(np.mean(negative_selected))
-
     except Exception as e:
         if debug_mode:
             raise
         log.error(
-            "baseline preparation failed for channel %s: %s",
+            "reading channel %s failed, neither its baseline nor its triggers "
+            "were measured: %s: %s",
             chn_id,
-            e
+            type(e).__name__,
+            e,
         )
-        success = False
+        read_ok = False
+        baseline_success = False
+        trigger_success = False
+
+    if read_ok:
+        try:
+            if n_baseline == 0:
+                msg = "no events passed the baseline selection"
+                raise RuntimeError(msg)
+
+            positive_selected = np.concatenate(positive_chunks)
+            negative_selected = np.concatenate(negative_chunks)
+            if len(positive_selected) == 0 or len(negative_selected) == 0:
+                msg = "no baseline events survived the dsp-tier non-finite cut"
+                raise RuntimeError(msg)
+
+            positive_baseline = float(np.mean(positive_selected))
+            negative_baseline = float(np.mean(negative_selected))
+        except Exception as e:
+            if debug_mode:
+                raise
+            log.error("baseline preparation failed for channel %s: %s", chn_id, e)
+            positive_baseline = None
+            negative_baseline = None
+            baseline_success = False
+
+        try:
+            if not idx_chunks:
+                msg = "no events passed the trigger selection"
+                raise RuntimeError(msg)
+
+            idxs = np.concatenate(idx_chunks).astype(np.int64)
+            amplitudes = np.concatenate(amplitude_chunks)
+
+            # a zero or non-finite trigger amplitude cannot be divided by
+            usable = np.isfinite(amplitudes) & (amplitudes != 0)
+            if not usable.all():
+                log.debug(
+                    "trigger %s: dropping %d of %d events with a non-finite or zero %s",
+                    chn_id,
+                    int((~usable).sum()),
+                    len(usable),
+                    trigger_param,
+                )
+                idxs = idxs[usable]
+                amplitudes = amplitudes[usable]
+
+            if len(idxs) == 0:
+                msg = "no events passed the trigger selection"
+                raise RuntimeError(msg)
+
+            trigger_idxs = idxs
+            trigger_amplitudes = amplitudes
+        except Exception as e:
+            if debug_mode:
+                raise
+            log.error("trigger selection failed for channel %s: %s", chn_id, e)
+            trigger_idxs = np.empty(0, dtype=np.int64)
+            trigger_amplitudes = np.empty(0)
+            trigger_success = False
+
+    log.info(
+        "channel %s: baseline %s, %s trigger events",
+        chn_id,
+        "measured" if baseline_success else "not measured",
+        len(trigger_idxs),
+    )
 
     return {
         "detector_id": chn_id,
         "positive_baseline": positive_baseline,
         "negative_baseline": negative_baseline,
-        "success": success,
+        "trigger_idxs": trigger_idxs,
+        "trigger_amplitudes": trigger_amplitudes,
+        "baseline_success": baseline_success,
+        "trigger_success": trigger_success,
         "processed_at": datetime.now().isoformat(),
         "parameters": {
-            "baseline_conditions": conditions,
+            "baseline_conditions": baseline_conditions,
+            "trigger_conditions": trigger_conditions,
+            "trigger_energy_range": list(trigger_energy_range),
             "energy_param": energy_param,
             "positive_param": positive_param,
             "negative_param": negative_param,
+            "trigger_param": trigger_param,
         },
     }
 
 
-def _resolve_baseline(baseline: dict, chn_id: str | int) -> tuple[float, float] | None:
+def _resolve_trigger(
+    triggers: dict, chn_id: str | int
+) -> tuple[np.ndarray, np.ndarray] | None:
     """
-    Return ``(positive, negative)`` for *chn_id*, or None if unusable.
+    Return ``(idxs, amplitudes)`` for *chn_id*, or None if unusable.
     """
-    entry = baseline.get(chn_id)
+    entry = triggers.get(chn_id)
     if entry is None:
-        entry = baseline.get(str(chn_id))
+        entry = triggers.get(str(chn_id))
     if not isinstance(entry, dict):
         return None
 
-    positive = entry.get("positive_baseline")
-    negative = entry.get("negative_baseline")
-    if positive is None or negative is None:
+    idxs = entry.get("trigger_idxs")
+    amplitudes = entry.get("trigger_amplitudes")
+    if idxs is None or amplitudes is None:
         return None
 
-    positive = float(positive)
-    negative = float(negative)
-    if not np.isfinite(positive) or not np.isfinite(negative):
+    idxs = np.asarray(idxs, dtype=np.int64)
+    # not cast to float64: the cross-talk ratio is computed in whatever
+    # precision the dsp tier stored the amplitude in
+    amplitudes = np.asarray(amplitudes)
+    if idxs.size != amplitudes.size:
+        msg = (
+            f"channel {chn_id} has {idxs.size} trigger indices but "
+            f"{amplitudes.size} trigger amplitudes"
+        )
+        raise ValueError(msg)
+    if idxs.size == 0:
         return None
 
-    return positive, negative
+    return idxs, amplitudes
 
 
 def _build_hist(
@@ -262,28 +405,30 @@ def _build_hist(
 def xtalk_column(
     hit_files: str | list,
     dsp_files: str | list,
-    trigger_detector_id: str | int,
-    baseline: dict,
+    response_detector_id: str | int,
+    positive_baseline: float | str,
+    negative_baseline: float | str,
+    triggers: dict,
     config: dict | None = None,
     buffer_len: int = DEFAULT_BUFFER_LEN,
     debug_mode: bool = False,
 ) -> dict:
     """Fill the histograms for one column of the cross-talk matrix.
 
-    Selects the events in which *trigger_detector_id* fired with 
-    high enough energy (determined by *trigger_energy_range* in *config*). 
+    A column fixes the *responding* detector: it holds one element per trigger
+    detector, each the distribution of the energy *response_detector_id* picked
+    up while that trigger fired.
 
-    Then, for each detector in the keys of *baseline*, among these events, it 
-    further selects the events in which the detector did *not* 
-    fire with high energy (otherwise it's multiplicity event).
+    The response channel is read once, up front, and every element is then
+    served by indexing those arrays at the trigger events that
+    :func:`get_baseline_and_trigger_amps` already selected.  That is what makes
+    a column cost one pass over one channel rather than one pass per pair, and
+    it is why the only baseline a column needs is the response's own.
 
-    Finally, calculates the per-event cross talk value for each of these events
-    and fills them into a histogram. 
-
-    Detector pairs skipped are recorded with ``valid = False`` and an empty
-    histogram. This happens when the response channel is the trigger itself, or when
-    either channel has no usable baseline (missing, ``None`` or non-finite).  If the
-    *trigger* channel has no usable baseline the whole column is skipped.
+    Elements skipped are recorded with ``valid = False`` and an empty
+    histogram.  This happens when the trigger channel is the response itself,
+    or when the trigger channel selected no usable events.  If the response
+    channel has no usable baseline the whole column is skipped.
 
     Parameters
     ----------
@@ -292,17 +437,24 @@ def xtalk_column(
     dsp_files
         DSP-tier file, or list of files, holding the amplitudes.  Must cover
         the same events, in the same order, as *hit_files*.
-    trigger_detector_id
-        Channel id of the trigger detector, without the ``ch`` prefix.
-    baseline
-        Per-channel baselines, as produced by :func:`prepare_baseline` and
-        collected by channel id. It should have the following structure: 
-        {chn_id: {"positive_baseline": float, "negative_baseline": float}, ...}
+    response_detector_id
+        Channel id of the responding detector, without the ``ch`` prefix.
+    positive_baseline, negative_baseline
+        The response channel's own baselines, as measured by
+        :func:`get_baseline_and_trigger_amps`.  Subtracted from the positive-
+        and negative-going amplitudes before the ratio is taken.  Anything
+        :func:`float` accepts will do.
+    triggers
+        Per-channel trigger selections, as produced by
+        :func:`get_baseline_and_trigger_amps` and collected by channel id.
+        The keys are the trigger detectors the column covers, in the order
+        its elements come out in.  Each value needs at least the structure:
+        {chn_id: {"trigger_idxs": array, "trigger_amplitudes": array}, ...}
 
         for example:
             {
-                1104000: {"positive_baseline": 5.0, "negative_baseline": -3.0},
-                1104001: {"positive_baseline": None, "negative_baseline": None},
+                1104000: {"trigger_idxs": [3, 17], "trigger_amplitudes": [2.1, 3.4]},
+                1104001: {"trigger_idxs": [], "trigger_amplitudes": []},
                 ...
             }
     config
@@ -310,31 +462,30 @@ def xtalk_column(
         optional:
 
         ``energy_param``
-            Hit-tier field both selections are applied to.  Default
+            Hit-tier field the response selection is applied to.  Default
             ``"cuspEmax_ctc_cal"``.
-        ``trigger_param``
-            DSP-tier field giving the trigger energy in the denominator of
-            the cross-talk ratio.  Default ``"trapTmax"``.
         ``positive_param``, ``negative_param``
             DSP-tier response fields histogrammed against the positive and
             negative baselines.  Default ``"trapTmax"`` and ``"trapTmin"``.
-        ``trigger_conditions``, ``response_conditions``
-            Mappings of hit-tier flag field to the value it must equal, for
-            the trigger and response selections respectively.  Default
-            ``{"is_highly_positive_polarity_candidate": 511}`` and ``{}``.
-        ``trigger_energy_range``
-            ``(emin, emax)`` on ``energy_param`` selecting real triggers.
-            Default ``(1500, 99999)``.
+        ``response_conditions``
+            Mapping of hit-tier flag field to the value it must equal for the
+            response selection.  Default ``{}``.
         ``response_energy_range``
-            ``(emin, emax)`` on ``energy_param`` selecting channels that did
-            *not* see a real hit.  Default ``(-99999, 100)``.
+            ``(emin, emax)`` on ``energy_param`` selecting events in which the
+            response channel did *not* see a real hit -- an event in which it
+            did is a multiplicity event, not cross-talk.  Default
+            ``(-99999, 100)``.
         ``nbins``
             Bins per histogram.  Default 700.
         ``range_multiplier``
             Histogram half-width in standard deviations about the mean.
             Default 3.
+
+        The trigger side of the selection is not configured here: it was
+        already applied by :func:`get_baseline_and_trigger_amps`, and the
+        configuration it used is recorded in its own result.
     buffer_len
-        Rows read per chunk during the trigger selection.
+        Rows read per chunk during the response selection.
     debug_mode
         If True, re-raise instead of falling back to an empty column or an
         empty element.
@@ -342,7 +493,7 @@ def xtalk_column(
     Returns
     -------
     dict
-        ``trigger_id``, ``response_ids`` ``(N,)``, ``valid`` ``(N,)`` bool,
+        ``response_id``, ``trigger_ids`` ``(N,)``, ``valid`` ``(N,)`` bool,
         ``n_events`` ``(N,)``, ``neg_counts``/``pos_counts`` ``(N, nbins)``,
         ``neg_bins``/``pos_bins`` ``(N, nbins + 1)``, ``parameters`` and
         ``processed_at``.  Bins are NaN wherever the histogram is empty.
@@ -350,155 +501,147 @@ def xtalk_column(
 
     config = config or {}
     energy_param = config.get("energy_param", DEFAULT_ENERGY_PARAM)
-    trigger_param = config.get("trigger_param", DEFAULT_TRIGGER_PARAM)
     positive_param = config.get("positive_param", DEFAULT_POSITIVE_PARAM)
     negative_param = config.get("negative_param", DEFAULT_NEGATIVE_PARAM)
-    trigger_conditions = dict(
-        config.get("trigger_conditions", DEFAULT_TRIGGER_CONDITIONS)
-    )
-    response_conditions = config.get("response_conditions", {})
-    trigger_energy_range = tuple(
-        config.get("trigger_energy_range", DEFAULT_TRIGGER_ENERGY_RANGE)
-    )
+    response_conditions = dict(config.get("response_conditions", {}))
     response_energy_range = tuple(
         config.get("response_energy_range", DEFAULT_RESPONSE_ENERGY_RANGE)
     )
     nbins = int(config.get("nbins", DEFAULT_NBINS))
     range_multiplier = float(config.get("range_multiplier", DEFAULT_RANGE_MULTIPLIER))
 
-    chn_id_list = list(baseline.keys())
-    n_response = len(chn_id_list)
-    neg_counts = np.zeros((n_response, nbins), dtype=np.int64)
-    pos_counts = np.zeros((n_response, nbins), dtype=np.int64)
-    neg_bins = np.full((n_response, nbins + 1), np.nan)
-    pos_bins = np.full((n_response, nbins + 1), np.nan)
-    valid = np.zeros(n_response, dtype=bool)
-    n_events = np.zeros(n_response, dtype=np.int64)
+    trigger_id_list = list(triggers.keys())
+    n_trigger = len(trigger_id_list)
+    neg_counts = np.zeros((n_trigger, nbins), dtype=np.int64)
+    pos_counts = np.zeros((n_trigger, nbins), dtype=np.int64)
+    neg_bins = np.full((n_trigger, nbins + 1), np.nan)
+    pos_bins = np.full((n_trigger, nbins + 1), np.nan)
+    valid = np.zeros(n_trigger, dtype=bool)
+    n_events = np.zeros(n_trigger, dtype=np.int64)
 
-    trigger_idxs = None
-    trigger_amplitudes_all = None
+    response_keep = None
+    positive_response = None
+    negative_response = None
 
-    # trigger selection. Only need to be done once per column.
+    # response selection. Only needs to be done once per column, because it
+    # does not depend on which channel triggered.
     try:
-        if _resolve_baseline(baseline, trigger_detector_id) is None:
-            msg = f"trigger channel {trigger_detector_id} has no usable baseline"
+        positive_baseline = _usable_baseline(positive_baseline)
+        negative_baseline = _usable_baseline(negative_baseline)
+        if positive_baseline is None or negative_baseline is None:
+            msg = f"response channel {response_detector_id} has no usable baseline"
             raise RuntimeError(msg)
 
         try:
             dsp_iterator = lh5.LH5Iterator(
                 dsp_files,
-                f"ch{trigger_detector_id}/dsp",
-                field_mask=[trigger_param],
+                f"ch{response_detector_id}/dsp",
+                field_mask=[positive_param, negative_param],
                 buffer_len=buffer_len,
             )
             hit_iterator = lh5.LH5Iterator(
                 hit_files,
-                f"ch{trigger_detector_id}/hit",
-                field_mask=[energy_param, *trigger_conditions],
+                f"ch{response_detector_id}/hit",
+                field_mask=[energy_param, *response_conditions],
                 buffer_len=buffer_len,
                 friend=dsp_iterator,
                 friend_suffix=_DSP_SUFFIX,
             )
 
-            idx_chunks = []
-            amplitude_chunks = []
+            keep_chunks = []
+            positive_chunks = []
+            negative_chunks = []
+            n_read = 0
             for table in hit_iterator:
-                mask = _selection_mask(
-                    table, energy_param, trigger_conditions, trigger_energy_range
+                # a trigger index addresses a row of these arrays directly, so
+                # the chunks have to arrive in order and leave no gap
+                entries = hit_iterator.current_global_entries
+                if len(entries) and entries[0] != n_read:
+                    msg = (
+                        f"the buffer starts at global entry {entries[0]} where "
+                        f"{n_read} was expected, so row {n_read} of this channel "
+                        f"is not the event a trigger index of {n_read} means"
+                    )
+                    raise RuntimeError(msg)
+                n_read += len(entries)
+
+                keep_chunks.append(
+                    _selection_mask(
+                        table,
+                        energy_param,
+                        response_conditions,
+                        response_energy_range,
+                    )
                 )
-                idx_chunks.append(hit_iterator.current_global_entries[mask])
-                amplitude_chunks.append(table[f"{trigger_param}{_DSP_SUFFIX}"].nda[mask])
+                positive_chunks.append(table[f"{positive_param}{_DSP_SUFFIX}"].nda)
+                negative_chunks.append(table[f"{negative_param}{_DSP_SUFFIX}"].nda)
         except Exception as e:
-            msg = f"trigger event selection failed: {type(e).__name__}: {e}"
+            msg = f"response event selection failed: {type(e).__name__}: {e}"
             raise RuntimeError(msg) from e
 
-        if not idx_chunks:
-            msg = "no events passed the trigger selection"
+        if n_read == 0:
+            msg = "the response channel holds no events"
             raise RuntimeError(msg)
 
-        trigger_idxs = np.concatenate(idx_chunks).astype(np.int64)
-        trigger_amplitudes_all = np.concatenate(amplitude_chunks)
-
-        usable = np.isfinite(trigger_amplitudes_all) & (trigger_amplitudes_all != 0)
-        if not usable.all():
-            log.debug(
-                "trigger %s: dropping %d of %d events with a non-finite or zero %s",
-                trigger_detector_id,
-                int((~usable).sum()),
-                len(usable),
-                trigger_param,
-            )
-            trigger_idxs = trigger_idxs[usable]
-            trigger_amplitudes_all = trigger_amplitudes_all[usable]
-
-        if len(trigger_idxs) == 0:
-            msg = "no events passed the trigger selection"
-            raise RuntimeError(msg)
+        response_keep = np.concatenate(keep_chunks)
+        positive_response = np.concatenate(positive_chunks)
+        negative_response = np.concatenate(negative_chunks)
 
     except Exception as e:
         if debug_mode:
             raise
         log.error(
-            "xtalk column for trigger %s failed, writing an empty column: %s",
-            trigger_detector_id,
+            "xtalk column for response %s failed, writing an empty column: %s",
+            response_detector_id,
             e,
         )
-        trigger_idxs = None
+        response_keep = None
 
-    # loop over response detectors starts here 
-    # If trigger selection failed or the trigger baseline is None, 
-    # skip the whole loop to saving an empty column. 
-    if trigger_idxs is not None:
-        for k, response_id in enumerate(chn_id_list):
-            if str(response_id) == str(trigger_detector_id):
-                log.debug("self-interaction at channel %s ignored", response_id)
+    # loop over trigger detectors starts here
+    # If the response selection failed or the response baseline is None,
+    # skip the whole loop to saving an empty column.
+    if response_keep is not None:
+        n_total = len(response_keep)
+        for k, trigger_id in enumerate(trigger_id_list):
+            if str(trigger_id) == str(response_detector_id):
+                log.debug("self-interaction at channel %s ignored", trigger_id)
                 continue
 
-            baselines = _resolve_baseline(baseline, response_id)
-            if baselines is None:
+            resolved = _resolve_trigger(triggers, trigger_id)
+            if resolved is None:
                 log.debug(
-                    "response channel %s has no usable baseline, skipping", response_id
+                    "trigger channel %s selected no usable events, skipping",
+                    trigger_id,
                 )
                 continue
-            positive_baseline, negative_baseline = baselines
+            trigger_idxs, trigger_amplitudes_all = resolved
 
             try:
-                response_hit = lh5.read(
-                    f"ch{response_id}/hit/",
-                    hit_files,
-                    field_mask=[energy_param, *response_conditions],
-                    idx=trigger_idxs,
-                )
+                if trigger_idxs.max() >= n_total:
+                    msg = (
+                        f"trigger index {trigger_idxs.max()} is past the "
+                        f"{n_total} events of channel {response_detector_id}, so "
+                        f"the two channels do not cover the same events"
+                    )
+                    raise IndexError(msg)
 
-                keep = _selection_mask(
-                    response_hit,
-                    energy_param,
-                    response_conditions,
-                    response_energy_range,
-                )
+                keep = response_keep[trigger_idxs]
                 coincident_idxs = trigger_idxs[keep]
                 trigger_amplitudes = trigger_amplitudes_all[keep]
 
-                response_dsp = lh5.read(
-                    f"ch{response_id}/dsp/",
-                    dsp_files,
-                    field_mask=[positive_param, negative_param],
-                    idx=coincident_idxs,
-                )
-
                 neg_vals = (
-                    response_dsp[negative_param].nda - negative_baseline
+                    negative_response[coincident_idxs] - negative_baseline
                 ) / trigger_amplitudes
                 pos_vals = (
-                    response_dsp[positive_param].nda - positive_baseline
+                    positive_response[coincident_idxs] - positive_baseline
                 ) / trigger_amplitudes
             except Exception as e:
                 if debug_mode:
                     raise
                 log.error(
                     "xtalk element (%s, %s) failed: %s",
-                    trigger_detector_id,
-                    response_id,
+                    trigger_id,
+                    response_detector_id,
                     e,
                 )
                 continue
@@ -512,8 +655,8 @@ def xtalk_column(
             else:
                 log.debug(
                     "negative histogram for element (%s, %s) is empty",
-                    trigger_detector_id,
-                    response_id,
+                    trigger_id,
+                    response_detector_id,
                 )
 
             pos_hist = _build_hist(pos_vals, nbins, range_multiplier)
@@ -522,33 +665,32 @@ def xtalk_column(
             else:
                 log.debug(
                     "positive histogram for element (%s, %s) is empty",
-                    trigger_detector_id,
-                    response_id,
+                    trigger_id,
+                    response_detector_id,
                 )
 
     parameters = {
         "energy_param": energy_param,
-        "trigger_param": trigger_param,
         "positive_param": positive_param,
         "negative_param": negative_param,
-        "trigger_conditions": trigger_conditions,
         "response_conditions": response_conditions,
-        "trigger_energy_range": list(trigger_energy_range),
         "response_energy_range": list(response_energy_range),
+        "positive_baseline": positive_baseline,
+        "negative_baseline": negative_baseline,
         "nbins": nbins,
         "range_multiplier": range_multiplier,
     }
 
     log.info(
-        "xtalk column of trigger %s filled, %s/%s elements",
-        trigger_detector_id,
+        "xtalk column of response %s filled, %s/%s elements",
+        response_detector_id,
         int(valid.sum()),
-        n_response,
+        n_trigger,
     )
 
     return {
-        "trigger_id": trigger_detector_id,
-        "response_ids": np.asarray(chn_id_list),
+        "response_id": response_detector_id,
+        "trigger_ids": np.asarray(trigger_id_list),
         "valid": valid,
         "n_events": n_events,
         "neg_counts": neg_counts,
@@ -680,10 +822,10 @@ def xtalk_histogram_fitter(
         config.get("sharp_fit_min_points", DEFAULT_SHARP_FIT_MIN_POINTS)
     )
 
-    trigger_id = histogram_data["trigger_id"]
-    response_ids = np.asarray(histogram_data["response_ids"])
+    response_id = histogram_data["response_id"]
+    trigger_ids = np.asarray(histogram_data["trigger_ids"])
     valid = np.asarray(histogram_data["valid"], dtype=bool)
-    n_response = len(response_ids)
+    n_trigger = len(trigger_ids)
 
     result = dict(histogram_data)
 
@@ -691,13 +833,13 @@ def xtalk_histogram_fitter(
         counts = np.asarray(histogram_data[f"{polarity}_counts"])
         bins = np.asarray(histogram_data[f"{polarity}_bins"])
 
-        amplitude = np.full(n_response, np.nan)
-        mu = np.full(n_response, np.nan)
-        sigma = np.full(n_response, np.nan)
-        total_counts = np.zeros(n_response, dtype=np.int64)
-        status = np.full(n_response, FIT_STATUS["not_filled"], dtype=np.int8)
+        amplitude = np.full(n_trigger, np.nan)
+        mu = np.full(n_trigger, np.nan)
+        sigma = np.full(n_trigger, np.nan)
+        total_counts = np.zeros(n_trigger, dtype=np.int64)
+        status = np.full(n_trigger, FIT_STATUS["not_filled"], dtype=np.int8)
 
-        for k in range(n_response):
+        for k in range(n_trigger):
             if not valid[k]:
                 continue
 
@@ -715,8 +857,8 @@ def xtalk_histogram_fitter(
                 log.error(
                     "%s fit of element (%s, %s) failed: %s",
                     polarity,
-                    trigger_id,
-                    response_ids[k],
+                    trigger_ids[k],
+                    response_id,
                     e,
                 )
                 status[k] = FIT_STATUS["fit_failed"]
@@ -740,12 +882,12 @@ def xtalk_histogram_fitter(
     result["fitted_at"] = datetime.now().isoformat()
 
     log.info(
-        "xtalk fits of trigger %s: %s negative and %s positive of %s elements "
+        "xtalk fits of response %s: %s negative and %s positive of %s elements "
         "converged",
-        trigger_id,
+        response_id,
         int(result["neg_success"].sum()),
         int(result["pos_success"].sum()),
-        n_response,
+        n_trigger,
     )
 
     return result
@@ -757,13 +899,17 @@ def build_xtalk_matrix(
 ) -> lgdo.Table:
     """Assemble the fitted columns of a cross-talk matrix into the matrix.
 
-    Element ``[j1, j2]`` of a matrix:  ``rawid_index[j1]`` represents triggered 
-    detector, while ``rawid_index[j2]`` represents the responding detector.  
+    Element ``[j1, j2]`` of a matrix:  ``rawid_index[j1]`` represents triggered
+    detector, while ``rawid_index[j2]`` represents the responding detector.
+
+    A column fixes the responding detector and runs over the triggers, so it
+    lands in column ``j2`` of the matrix, and the detector order of the matrix
+    is the trigger order every column shares.
 
     Parameters
     ----------
     fitted_columns
-        Result dicts of :func:`xtalk_histogram_fitter`, keyed by trigger
+        Result dicts of :func:`xtalk_histogram_fitter`, keyed by response
         channel id.
     config
         Recognised keys, all optional:
@@ -775,7 +921,7 @@ def build_xtalk_matrix(
     Returns
     -------
     lgdo.Table
-        A table with the following fields. Values are sorted in the order of 
+        A table with the following fields. Values are sorted in the order of
         ``rawid_index``:
 
         ``rawid_index`` ``(N,)``
@@ -787,31 +933,33 @@ def build_xtalk_matrix(
         ``..._sigma`` ``(N, N)``
             The width of each of those fits, also as fractions.
         ``..._status`` ``(N, N)``
-            The :data:`FIT_STATUS` code of each element, meaning explained in 
-            :func:`xtalk_histogram_fitter`. 
+            The :data:`FIT_STATUS` code of each element, meaning explained in
+            :func:`xtalk_histogram_fitter`.
     """
     config = config or {}
     max_status = int(config.get("max_status", FIT_STATUS["low_stats"]))
 
-    columns = {int(trigger_id): column for trigger_id, column in fitted_columns.items()}
+    columns = {
+        int(response_id): column for response_id, column in fitted_columns.items()
+    }
     rawids = None
 
-    # Check whether the response id lists are identical across all columns
-    for trigger_id, column in columns.items():
-        response_ids = np.asarray(column["response_ids"], dtype=np.int64)
+    # Check whether the trigger id lists are identical across all columns
+    for response_id, column in columns.items():
+        trigger_ids = np.asarray(column["trigger_ids"], dtype=np.int64)
         if rawids is None:
-            rawids = response_ids
-        elif not np.array_equal(rawids, response_ids):
+            rawids = trigger_ids
+        elif not np.array_equal(rawids, trigger_ids):
             msg = (
-                f"column {trigger_id} covers different detectors, or covers "
+                f"column {response_id} covers different detectors, or covers "
                 f"them in a different order, than the columns before it"
             )
             raise ValueError(msg)
 
-        if int(column["trigger_id"]) != trigger_id:
+        if int(column["response_id"]) != response_id:
             msg = (
-                f"column filed under trigger {trigger_id} reports "
-                f"trigger_id {column['trigger_id']}"
+                f"column filed under response {response_id} reports "
+                f"response_id {column['response_id']}"
             )
             raise ValueError(msg)
 
@@ -819,8 +967,8 @@ def build_xtalk_matrix(
     unknown = sorted(set(columns) - set(index_of))
     if unknown:
         msg = (
-            f"columns {unknown} trigger on detectors that are not among the "
-            f"responses, so they have no row in the matrix"
+            f"columns {unknown} respond on detectors that are not among the "
+            f"triggers, so they have no column in the matrix"
         )
         raise ValueError(msg)
 
@@ -833,17 +981,17 @@ def build_xtalk_matrix(
         for p in ("neg", "pos")
     }
 
-    for trigger_id, column in columns.items():
-        row = index_of[trigger_id]
+    for response_id, column in columns.items():
+        col = index_of[response_id]
         for polarity in ("neg", "pos"):
             column_status = np.asarray(column[f"{polarity}_status"], dtype=np.int8)
             accepted = column_status <= max_status
 
-            status[polarity][row] = column_status
-            mu[polarity][row] = np.where(
+            status[polarity][:, col] = column_status
+            mu[polarity][:, col] = np.where(
                 accepted, np.asarray(column[f"{polarity}_mu"], dtype=float), np.nan
             )
-            sigma[polarity][row] = np.where(
+            sigma[polarity][:, col] = np.where(
                 accepted, np.asarray(column[f"{polarity}_sigma"], dtype=float), np.nan
             )
 
@@ -857,7 +1005,7 @@ def build_xtalk_matrix(
     missing = n_detectors - len(columns)
     if missing:
         log.warning(
-            "%s of %s detectors have no fitted column, their rows stay NaN",
+            "%s of %s detectors have no fitted column, their columns stay NaN",
             missing,
             n_detectors,
         )
