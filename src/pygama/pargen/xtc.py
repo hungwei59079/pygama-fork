@@ -2,19 +2,27 @@
 This module provides routines for measuring cross-talk (XTC) between
 germanium channels and for building the resulting cross-talk matrix.
 
-The three main functions, in order of execution, are:
-prepare_detector, xtalk_element, and build_xtalk_matrix.
+The four main functions, in order of execution, are:
+prepare_detector, attach_response_amps, xtalk_element, and build_xtalk_matrix.
 
-All of the file reading happens in the first of them, once per channel and
-independently of every other channel.  It selects what that detector
-contributes in both of its roles: the events it triggered on and the
-amplitude each of them fired with, and the baselines and per-event amplitudes
-it shows when it responds instead.  The three functions after it never open a
-file, so an N x N matrix costs N reads rather than one per detector pair, and
-the reads all happen in the same step.
+The first reads one channel, independently of every other channel, and keeps
+only what survives selection: the events it triggered on and the amplitude
+each of them fired with, the baselines it sits at, and a mask of the events
+in which it can be measured as a response.  All of that is either a scalar or
+one value per event, so a caller can afford to hold every channel's at once,
+or to write it to a file between the two stages.
 
-Which pairs to measure is the caller's choice: xtalk_element measures one
-ordered pair of detectors, and a whole matrix is the loop over them.
+The per-event amplitudes a channel shows when it responds are not in there.
+They are the one bulky thing a pair needs, and only the responding half of it
+needs them, so attach_response_amps fetches them separately, into what
+prepare_detector returned, for the one channel about to be used as a
+response.  Read once per responding channel -- outside the loop over the
+triggers measured against it, not inside it -- an N x N matrix costs N of
+those reads rather than one per pair.
+
+The two functions after that never open a file.  Which pairs to measure is
+the caller's choice: xtalk_element measures one ordered pair of detectors,
+and a whole matrix is the loop over them.
 
 :func:`plot_xtalk_matrix` draws what the last of them returns.
 """
@@ -51,8 +59,7 @@ DEFAULT_Y_MASK_THRESHOLD = 0.05
 DEFAULT_SHARP_FIT_MIN_POINTS = 5
 
 #: Outcome of fitting one histogram, ordered from the most to the least
-#: trustworthy.  Written into the lh5 file as ``fit_status_codes`` so a
-#: reader never has to hard-code these numbers.
+#: trustworthy. Written into the lh5 file as ``fit_status_codes``.
 FIT_STATUS = {
     "ok": 0,
     "ok_few_points": 1,
@@ -65,6 +72,35 @@ FIT_STATUS_SUCCESS = (FIT_STATUS["ok"], FIT_STATUS["ok_few_points"])
 
 XTC_LH5_FIELD = {"neg": "xtalk_matrix_negative", "pos": "xtalk_matrix_positive"}
 XTC_PLOT_RANGE = {"neg": (-0.003, 0.001), "pos": (-0.0007, 0.003)}
+
+# Keys that will be copied into the xtalk table as attributes to record 
+# the settings during production. 
+XTC_SELECTION_KEYS = {
+    "trigger": (
+        "energy_param",
+        "trigger_param",
+        "trigger_conditions",
+        "trigger_energy_range",
+    ),
+    "response": (
+        "energy_param",
+        "positive_param",
+        "negative_param",
+        "baseline_conditions",
+        "response_conditions",
+        "response_energy_range",
+    ),
+}
+XTC_SETTING_KEYS = (
+    "nbins",
+    "range_multiplier",
+    "low_stats_threshold",
+    "y_mask_threshold",
+    "sharp_fit_min_points",
+    "trigger_selection",
+    "response_selection",
+)
+
 
 def _selection_mask(
     table,
@@ -95,24 +131,17 @@ def prepare_detector(
     config: dict | None = None,
     debug_mode: bool = False,
 ) -> dict:
-    """Read one channel once and select everything the matrix needs from it.
+    """Read one channel once and keep the selections the matrix needs from it.
+    The primary information that is retrieved:
 
-    A detector enters the cross-talk matrix in two roles, and this measures
-    both of them in a single pass:
-
-    *as a trigger*
+    *trigger*
         the events in which it fired, as global entry numbers, together with
         the DSP amplitude each of them fired with -- the denominator of the
         cross-talk ratio.
-    *as a response*
-        its baselines, the amplitudes it recorded in every event, and which
-        of those events it may be measured in at all.
-
-    Nothing here depends on any other channel, so the N calls that cover a
-    whole array are independent of each other, and no later step has to open
-    a hit or dsp file again.  The three selections are independent of each
-    other too: each reports its own flag, and a failure to read the channel
-    at all fails every one of them.
+    *response*
+        its baselines (pos & neg) and a bitmask of which events are usable as
+        cross-talk responses.  The response amplitudes themselves are left to
+        :func:`attach_response_amps`, so that what this returns stays small.
 
     Parameters
     ----------
@@ -164,16 +193,26 @@ def prepare_detector(
     dict
         ``detector_id``, ``n_rows``, ``processed_at``, ``parameters``, and
         ``read_success``; then, for the response role, ``positive_baseline``
-        and ``negative_baseline``, ``response_keep`` ``(n_rows,)`` bool and
-        ``positive_response_amps``/``negative_response_amps`` ``(n_rows,)``, guarded by
-        ``baseline_success``; and for the trigger role, ``trigger_idxs`` and
-        ``trigger_amplitudes``, guarded by ``trigger_success``.
+        and ``negative_baseline`` guarded by ``baseline_success``, and
+        ``response_keep`` ``(n_rows,)`` bool; and for the trigger role,
+        ``trigger_idxs`` and ``trigger_amplitudes``, guarded by
+        ``trigger_success``.
+
+        Nothing in here is longer than one value per event, and only
+        ``response_keep`` is that long, so the whole of it is cheap to hold
+        for every channel at once or to write out between stages.  The
+        per-event response amplitudes are not part of it:
+        :func:`attach_response_amps` adds them.
+
+        ``parameters`` records the selection above and the *dsp_files* it was
+        applied to, which is what lets :func:`attach_response_amps` read the
+        same fields from the same files later.
 
         The two baselines are either both finite floats or both ``None``;
         there is no third outcome, and in particular never a NaN, an infinity
-        or one of each.  The three response arrays are empty when the channel
-        could not be read, and the two trigger arrays are empty when its
-        trigger selection found nothing.
+        or one of each.  ``response_keep`` is empty when the channel could not
+        be read, and the two trigger arrays are empty when its trigger
+        selection found nothing.
 
     Notes
     -----
@@ -220,8 +259,6 @@ def prepare_detector(
     negative_baseline = None
     n_rows = 0
     response_keep = np.empty(0, dtype=bool)
-    positive_response_amps = np.empty(0, dtype=np.float32)
-    negative_response_amps = np.empty(0, dtype=np.float32)
     trigger_idxs = np.empty(0, dtype=np.int64)
     trigger_amplitudes = np.empty(0, dtype=np.float32)
 
@@ -242,14 +279,14 @@ def prepare_detector(
         del hit_table
 
         dsp_table = lh5.read(f"ch{chn_id}/dsp/", dsp_files, field_mask=dsp_fields)
-        positive_response_amps = dsp_table[positive_param].nda
-        negative_response_amps = dsp_table[negative_param].nda
+        positive_amps = dsp_table[positive_param].nda
+        negative_amps = dsp_table[negative_param].nda
         trigger_amps_all = dsp_table[trigger_param].nda
 
-        if len(positive_response_amps) != n_rows:
+        if len(positive_amps) != n_rows:
             msg = (
                 f"the hit tier holds {n_rows} events and the dsp tier "
-                f"{len(positive_response_amps)}, so they do not describe the same "
+                f"{len(positive_amps)}, so they do not describe the same "
                 f"events"
             )
             raise RuntimeError(msg)
@@ -267,13 +304,11 @@ def prepare_detector(
         trigger_success = False
         n_rows = 0
         response_keep = np.empty(0, dtype=bool)
-        positive_response_amps = np.empty(0, dtype=np.float32)
-        negative_response_amps = np.empty(0, dtype=np.float32)
 
     if read_success:
         try:
-            positive_baseline_vals = positive_response_amps[baseline_mask]
-            negative_baseline_vals = negative_response_amps[baseline_mask]
+            positive_baseline_vals = positive_amps[baseline_mask]
+            negative_baseline_vals = negative_amps[baseline_mask]
             positive_baseline_vals = positive_baseline_vals[np.isfinite(positive_baseline_vals)]
             negative_baseline_vals = negative_baseline_vals[np.isfinite(negative_baseline_vals)]
             if len(positive_baseline_vals) == 0 or len(negative_baseline_vals) == 0:
@@ -344,8 +379,6 @@ def prepare_detector(
         "positive_baseline": positive_baseline,
         "negative_baseline": negative_baseline,
         "response_keep": response_keep,
-        "positive_response_amps": positive_response_amps,
-        "negative_response_amps": negative_response_amps,
         "trigger_idxs": trigger_idxs,
         "trigger_amplitudes": trigger_amplitudes,
         "read_success": read_success,
@@ -362,8 +395,125 @@ def prepare_detector(
             "positive_param": positive_param,
             "negative_param": negative_param,
             "trigger_param": trigger_param,
+            "hit_files": [hit_files] if isinstance(hit_files, str) else list(hit_files),
+            "dsp_files": [dsp_files] if isinstance(dsp_files, str) else list(dsp_files),
         },
     }
+
+
+def attach_response_amps(
+    detector_info: dict,
+    dsp_files: str | list | None = None,
+    debug_mode: bool = False,
+) -> dict:
+    """Add the per-event response amplitudes to a :func:`prepare_detector` result.
+
+    These are the one bulky thing an element needs, and only the responding
+    half of the pair needs them, which is why :func:`prepare_detector` leaves
+    them out: what it returns is small enough to hold for every channel at
+    once or to write out between stages, and this fills in the rest for the
+    one channel about to be measured as a response.
+
+    Read once per responding channel and reuse the result for every trigger
+    measured against it.  Calling this once per :func:`xtalk_element` instead
+    costs a read per pair, which is the thing the split exists to avoid.
+
+    Parameters
+    ----------
+    detector_info
+        A :func:`prepare_detector` result, which is not modified.
+        ``detector_id`` and ``n_rows`` are read from it, and
+        ``positive_param`` and ``negative_param`` from its ``parameters``, so
+        the fields read here are the ones that channel was prepared with
+        rather than whatever the caller's configuration now says.
+    dsp_files
+        DSP-tier file, or list of files, holding the amplitudes.  Must be the
+        same files, in the same order, that *detector_info* was prepared
+        from: the arrays are indexed by positions recorded back then, and a
+        different order supplies the right number of amplitudes in the wrong
+        places.  Defaults to the file list ``parameters`` recorded, which is
+        the way to be sure of that.
+    debug_mode
+        If True, re-raise instead of falling back to empty arrays.
+
+    Returns
+    -------
+    dict
+        A shallow copy of *detector_info* with ``positive_response_amps`` and
+        ``negative_response_amps`` ``(n_rows,)`` added, which is what
+        :func:`xtalk_element` wants of a responding channel.
+
+        Both are empty if the read failed, or if the channel had already
+        failed to be prepared.  That is the same outcome as a channel with no
+        events: every element measured against it comes out unfilled, rather
+        than measured against amplitudes that are not its own.
+
+    Notes
+    -----
+    A file list covering different events is caught only when it holds a
+    different *number* of them.  Same length in a different order is not
+    detectable here, and would be measured as though it were real, which is
+    what the default above is for.
+    """
+    detector_id = detector_info.get("detector_id")
+    parameters = detector_info.get("parameters") or {}
+    positive_param = parameters.get("positive_param", DEFAULT_POSITIVE_PARAM)
+    negative_param = parameters.get("negative_param", DEFAULT_NEGATIVE_PARAM)
+    n_rows = int(detector_info.get("n_rows", 0))
+    if dsp_files is None:
+        dsp_files = parameters.get("dsp_files")
+
+    positive_response_amps = np.empty(0, dtype=np.float32)
+    negative_response_amps = np.empty(0, dtype=np.float32)
+
+    if not detector_info.get("read_success", True):
+        log.debug(
+            "channel %s was never read, so it has no amplitudes to attach",
+            detector_id,
+        )
+    else:
+        try:
+            if dsp_files is None:
+                msg = (
+                    "no dsp files to read: pass them, or prepare the channel "
+                    "with a version that records them"
+                )
+                raise RuntimeError(msg)
+
+            dsp_fields = list(dict.fromkeys([positive_param, negative_param]))
+            dsp_table = lh5.read(
+                f"ch{detector_id}/dsp/", dsp_files, field_mask=dsp_fields
+            )
+            positive = dsp_table[positive_param].nda
+            negative = dsp_table[negative_param].nda
+
+            if len(positive) != n_rows or len(negative) != n_rows:
+                msg = (
+                    f"channel {detector_id} was prepared over {n_rows} events "
+                    f"but these files hold {len(positive)}, so they are not "
+                    f"the files it was prepared from"
+                )
+                raise RuntimeError(msg)
+
+            positive_response_amps = positive
+            negative_response_amps = negative
+        except Exception as e:
+            if debug_mode:
+                raise
+            log.error(
+                "attaching response amplitudes to channel %s failed, so every "
+                "element measured against it will be unfilled: %s: %s",
+                detector_id,
+                type(e).__name__,
+                e,
+            )
+            positive_response_amps = np.empty(0, dtype=np.float32)
+            negative_response_amps = np.empty(0, dtype=np.float32)
+
+    attached = dict(detector_info)
+    attached["positive_response_amps"] = positive_response_amps
+    attached["negative_response_amps"] = negative_response_amps
+    return attached
 
 
 def _resolve_trigger(detector_info: dict) -> tuple[np.ndarray, np.ndarray] | None:
@@ -485,9 +635,11 @@ def xtalk_element(
     The events in which that happened are histogrammed and the histogram is
     fitted, both here, so the caller gets a number rather than a distribution.
 
-    Nothing is read.  Both sides arrive as :func:`prepare_detector` results,
-    which is what makes an element cheap enough that a caller can afford to
-    loop over every pair: the reads already happened, once per detector.
+    Nothing is read.  Both sides arrive already prepared -- the trigger as a
+    :func:`prepare_detector` result, the response as one that has been
+    through :func:`attach_response_amps` as well -- which is what makes an
+    element cheap enough that a caller can afford to loop over every pair:
+    the reads already happened, once per detector.
 
     Which pairs to measure is left to the caller.  A whole matrix is the
     N x N loop over them, a single suspicious pair is one call, and neither
@@ -504,11 +656,12 @@ def xtalk_element(
     trigger_detector_info
         The :func:`prepare_detector` result of the triggering channel.  Only
         ``detector_id``, ``trigger_idxs`` and ``trigger_amplitudes`` are read,
-        so a caller that has dropped the bulky response arrays may pass what
-        is left.
+        so a channel used only as a trigger never needs
+        :func:`attach_response_amps` run on it.
     response_detector_info
-        The :func:`prepare_detector` result of the responding channel.  Read
-        for ``detector_id``, ``positive_baseline`` and ``negative_baseline``,
+        The :func:`prepare_detector` result of the responding channel, with
+        the amplitudes added by :func:`attach_response_amps`.  Read for
+        ``detector_id``, ``positive_baseline`` and ``negative_baseline``,
         ``response_keep``, and ``positive_response_amps`` and
         ``negative_response_amps``.
     config
@@ -529,8 +682,9 @@ def xtalk_element(
             Bins that mask must leave for the fit to use it.  Default 5.
 
         The event selection is not configured here: it was already applied by
-        :func:`prepare_detector`, and the configuration it used is recorded in
-        its own result.
+        :func:`prepare_detector`.  The half of that configuration each side
+        used is copied into ``parameters`` below, so what an element was
+        measured with travels with the element.
     debug_mode
         If True, re-raise instead of recording an unfilled or failed element.
 
@@ -543,6 +697,13 @@ def xtalk_element(
         ``{neg,pos}_mu``, ``{neg,pos}_sigma``, ``{neg,pos}_total_counts``,
         ``{neg,pos}_status`` and ``{neg,pos}_success`` holding the fit.
         Finally ``parameters``, ``fit_status_codes`` and ``processed_at``.
+
+        ``parameters`` holds the two baselines the amplitudes were measured
+        against, the histogram and fit settings above, and the selection each
+        side was prepared with under ``trigger_selection`` and
+        ``response_selection``.  Everything in it except the baselines is a
+        setting of the production rather than of this pair, which is what lets
+        :func:`build_xtalk_matrix` record one set of them for a whole matrix.
 
         The fit statuses are the values of :data:`FIT_STATUS`:
 
@@ -596,6 +757,19 @@ def xtalk_element(
 
             positive_baseline = float(positive_baseline)
             negative_baseline = float(negative_baseline)
+
+            missing = [
+                key
+                for key in ("positive_response_amps", "negative_response_amps")
+                if key not in response_detector_info
+            ]
+            if missing:
+                msg = (
+                    f"response channel {response_id} is missing {', '.join(missing)}: "
+                    f"a responding channel has to go through attach_response_amps "
+                    f"before it can be measured against"
+                )
+                raise KeyError(msg)
 
             response_keep = np.asarray(
                 response_detector_info["response_keep"], dtype=bool
@@ -719,6 +893,9 @@ def xtalk_element(
         result[f"{polarity}_total_counts"] = int(total_counts)
         result[f"{polarity}_status"] = int(status)
         result[f"{polarity}_success"] = int(status) in FIT_STATUS_SUCCESS
+    
+    trigger_parameters = trigger_detector_info.get("parameters", {})
+    response_parameters = response_detector_info.get("parameters", {})
 
     result["parameters"] = {
         "positive_baseline": positive_baseline,
@@ -728,6 +905,8 @@ def xtalk_element(
         "low_stats_threshold": low_stats_threshold,
         "y_mask_threshold": y_mask_threshold,
         "sharp_fit_min_points": sharp_fit_min_points,
+        "trigger_selection": {key: trigger_parameters[key] for key in XTC_SELECTION_KEYS["trigger"] if key in trigger_parameters},
+        "response_selection": {key: response_parameters[key] for key in XTC_SELECTION_KEYS["response"] if key in response_parameters},
     }
     result["fit_status_codes"] = FIT_STATUS
     result["processed_at"] = datetime.now().isoformat()
@@ -744,9 +923,22 @@ def xtalk_element(
     return result
 
 
+def _differing_keys(left: dict, right: dict, prefix: str = "") -> list[str]:
+    """Which settings two elements disagree on, named down to the leaf."""
+    differing = []
+    for key in sorted(set(left) | set(right)):
+        left_value, right_value = left.get(key), right.get(key)
+        if left_value == right_value:
+            continue
+        if isinstance(left_value, dict) and isinstance(right_value, dict):
+            differing += _differing_keys(left_value, right_value, f"{prefix}{key}.")
+        else:
+            differing.append(f"{prefix}{key}")
+    return differing
+
+
 def build_xtalk_matrix(
-    fitted_elements,
-    rawids=None,
+    fitted_elements: list[dict],
     config: dict | None = None,
 ) -> lgdo.Table:
     """Assemble measured cross-talk elements into the matrix.
@@ -757,21 +949,24 @@ def build_xtalk_matrix(
     Parameters
     ----------
     fitted_elements
-        Iterable of :func:`xtalk_element` results.  Each carries the pair it
-        measured, so they may arrive in any order, and a pair that is left out
-        keeps a NaN cell rather than breaking the matrix.  Providing the same
-        pair twice is an error.
-    rawids
-        The detectors of the matrix, in the order its rows and columns take.
-        Defaults to the order the ids are first seen in *fitted_elements*,
-        which is the caller's loop order; pass it explicitly whenever that
-        order matters, since it decides what every index means.
+        List of :func:`xtalk_element` results.  Each carries the pair it
+        measured, so the matrix spans exactly the detectors these elements
+        name, in the order those ids first appear in the list: order the list
+        to order the rows and columns, and pass a shorter list to build a
+        smaller matrix.  A pair no element covers keeps a NaN cell rather than
+        breaking the matrix, while the same pair measured twice is an error.
     config
         Recognised keys, all optional:
 
         ``max_status``
             Highest :data:`FIT_STATUS` code to accept into the matrix. Default
             ``FIT_STATUS["low_stats"]``.
+        ``require_same_parameters``
+            Whether elements that disagree on the settings listed in
+            :data:`XTC_SETTING_KEYS` are an error.  They are the sign of
+            elements from more than one production being assembled into a
+            single matrix, which is why this defaults to True; set it False to
+            downgrade the refusal to a warning.
 
     Returns
     -------
@@ -790,37 +985,34 @@ def build_xtalk_matrix(
         ``..._status`` ``(N, N)``
             The :data:`FIT_STATUS` code of each element, meaning explained in
             :func:`xtalk_element`.
+
+        Two attributes travel with the table into the lh5 file, both JSON:
+        ``fit_status_codes``, so a reader never has to hard-code the status
+        numbers, and ``parameters``, the settings every element of this matrix
+        was produced with -- ``max_status`` and the :data:`XTC_SETTING_KEYS`
+        of the elements.  A value JSON has no type for is recorded as its
+        ``str``.  Only settings go in there, never the arrays or the measured
+        baselines: the attributes describe the production, and a reader after
+        the per-detector numbers should open the element files instead.
+
+    Raises
+    ------
+    ValueError
+        If two elements measure the same pair, or, unless
+        ``require_same_parameters`` says otherwise, if they were not all
+        produced with the same settings.
     """
     config = config or {}
     max_status = int(config.get("max_status", FIT_STATUS["low_stats"]))
+    require_same_parameters = bool(config.get("require_same_parameters", True))
 
-    elements = list(fitted_elements)
+    # dict keys keep insertion order, so this is first-seen order
+    index_of: dict[int, int] = {}
+    for element in fitted_elements:
+        for key in ("trigger_id", "response_id"):
+            index_of.setdefault(int(element[key]), len(index_of))
 
-    if rawids is None:
-        # dict keys keep insertion order, so this is first-seen order
-        seen = {}
-        for element in elements:
-            seen.setdefault(int(element["trigger_id"]), None)
-            seen.setdefault(int(element["response_id"]), None)
-        rawids = list(seen)
-    rawids = [int(rawid) for rawid in rawids]
-
-    index_of = {rawid: j for j, rawid in enumerate(rawids)}
-    unknown = sorted(
-        {
-            int(element[key])
-            for element in elements
-            for key in ("trigger_id", "response_id")
-        }
-        - set(index_of)
-    )
-    if unknown:
-        msg = (
-            f"elements name detectors {unknown}, which are not among the "
-            f"{len(rawids)} detectors of the matrix"
-        )
-        raise ValueError(msg)
-
+    rawids = list(index_of)
     n_detectors = len(rawids)
     shape = (n_detectors, n_detectors)
     mu = {p: np.full(shape, np.nan) for p in ("neg", "pos")}
@@ -831,7 +1023,9 @@ def build_xtalk_matrix(
     }
 
     placed = set()
-    for element in elements:
+    settings = None
+    disagreeing = []
+    for element in fitted_elements:
         row = index_of[int(element["trigger_id"])]
         col = index_of[int(element["response_id"])]
         if (row, col) in placed:
@@ -841,6 +1035,20 @@ def build_xtalk_matrix(
             )
             raise ValueError(msg)
         placed.add((row, col))
+
+        parameters = element.get("parameters") or {}
+        element_settings = {key: parameters[key] for key in XTC_SETTING_KEYS if key in parameters}
+
+        if settings is None:
+            settings = element_settings
+        elif element_settings != settings:
+            disagreeing.append(
+                (
+                    element["trigger_id"],
+                    element["response_id"],
+                    _differing_keys(settings, element_settings),
+                )
+            )
 
         for polarity in ("neg", "pos"):
             element_status = int(element[f"{polarity}_status"])
@@ -865,8 +1073,28 @@ def build_xtalk_matrix(
             n_detectors**2,
         )
 
+    parameters = {"max_status": max_status}
+    if disagreeing:
+        trigger_id, response_id, differing = disagreeing[0]
+        msg = (
+            f"{len(disagreeing)} of {len(fitted_elements)} elements were not "
+            f"produced with the settings of the first one: the pair (trigger "
+            f"{trigger_id}, response {response_id}) differs in {differing}.  "
+            f"They are likely from different productions"
+        )
+        if require_same_parameters:
+            raise ValueError(msg)
+        log.warning("%s; the matrix records no settings of its own", msg)
+        parameters["mixed_parameters"] = True
+    elif settings:
+        parameters.update(settings)
+
     return lgdo.Table(
-        col_dict=col_dict, attrs={"fit_status_codes": json.dumps(FIT_STATUS)}
+        col_dict=col_dict,
+        attrs={
+            "fit_status_codes": json.dumps(FIT_STATUS),
+            "parameters": json.dumps(parameters, default=str),
+        },
     )
 
 
