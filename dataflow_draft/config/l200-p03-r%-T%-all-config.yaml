@@ -1,0 +1,35 @@
+# Paths only: what each snakemake rule reads, and how it logs.  The settings
+# themselves live in the files pointed at here.  `$_` is expanded by TextDB to
+# the directory this file is in.
+snakemake_rules:
+  tier_evt:
+    inputs:
+      evt_config:
+        - $_/tier/evt/l200-p03-r%-T%-all-evt_config.yaml
+        - $_/tier/evt/l200-p03-r%-T%-geds-evt_config.yaml
+        - $_/tier/evt/l200-p03-r%-T%-geds_qc-evt_config.yaml
+        - $_/tier/evt/l200-p03-r%-T%-geds_psd-evt_config.yaml
+        - $_/tier/evt/l200-p03-r%-T%-spms-evt_config.yaml
+      muon_config:
+        evt_config: $_/tier/evt/l200-p03-r%-T%-muon-evt_config.yaml
+        field_config: $_/tier/evt/l200-p03-r%-T%-muon-field_config.yaml
+    options:
+      logging: $_/log/basic_logging.yaml
+      logger: prod
+
+  # one config file for both cross-talk steps: the matrix and the detectors it
+  # is measured from have to agree on the selections, and build_xtalk_matrix
+  # refuses to assemble elements that were produced with different ones
+  pars_geds_xtc_detector_info:
+    inputs:
+      xtc_config: $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+    options:
+      logging: $_/log/basic_logging.yaml
+      logger: prod
+
+  pars_geds_xtc_matrix:
+    inputs:
+      xtc_config: $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+    options:
+      logging: $_/log/basic_logging.yaml
+      logger: prod

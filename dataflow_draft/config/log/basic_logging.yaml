@@ -1,0 +1,27 @@
+# Stand-in for the log config of inputs/dataprod/config/log.  build_log fills
+# handlers.dataflow.filename in from --log.
+version: 1
+# the pargen module takes its logger at import time, and dictConfig would
+# switch it off if this were left at its default of true
+disable_existing_loggers: false
+formatters:
+  dataflow:
+    format: "%(asctime)s %(name)s [%(levelname)s] %(message)s"
+    datefmt: "%Y-%m-%dT%H:%M:%SZ"
+handlers:
+  dataflow:
+    class: logging.FileHandler
+    level: INFO
+    formatter: dataflow
+    filename: /dev/null
+    mode: w
+loggers:
+  prod:
+    level: INFO
+    handlers: [dataflow]
+    propagate: false
+# so that pygama.pargen.xtc, which logs most of what is worth reading, lands in
+# the same file as the script's own messages
+root:
+  level: INFO
+  handlers: [dataflow]

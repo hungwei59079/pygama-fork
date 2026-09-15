@@ -1,0 +1,11 @@
+# Stand-in for the validity file of inputs/dataprod/config, so that this
+# directory can be handed to TextDB as --configs on its own.  Only the entries
+# the cross-talk steps need are here; the real one carries every period.
+#
+# `category` is the datatype TextDB.on() is called with.  There is no xtc or
+# ssc entry because Catalog.valid_for falls back to "all" for a category it
+# does not know, which is what the real config does too.
+- valid_from: 20230101T000000Z
+  category: all
+  apply:
+    - l200-p03-r%-T%-all-config.yaml

@@ -1,0 +1,50 @@
+# Settings of the cross-talk measurement.  One section per step; every key is
+# optional and falls back to the default of the pygama.pargen.xtc function it
+# is passed to, so a section may be left out entirely.
+
+# passed to prepare_detector, once per channel
+detector:
+  # hit-tier field the three selections below are applied to
+  energy_param: cuspEmax_ctc_cal
+
+  # events in which the detector saw nothing, averaged to give the baselines
+  # that are subtracted from the response amplitudes
+  baseline_conditions:
+    is_empty_candidate: 63
+
+  # events in which the detector fired, and the dsp field giving the amplitude
+  # it fired with -- the denominator of the cross-talk ratio.  The upper bound
+  # of the energy range throws out unphysical events.
+  trigger_conditions:
+    is_highly_positive_polarity_candidate: 511
+  trigger_energy_range: [1500, 99999]
+  trigger_param: trapTmax
+
+  # events in which the detector did not see a real hit, so that what it did
+  # see can be attributed to cross-talk rather than to multiplicity
+  response_conditions: {}
+  response_energy_range: [-99999, 100]
+  positive_param: trapTmax
+  negative_param: trapTmin
+
+# passed to xtalk_element, once per (trigger, response) pair
+element:
+  nbins: 700
+  range_multiplier: 3
+  low_stats_threshold: 100
+  y_mask_threshold: 0.05
+  sharp_fit_min_points: 5
+
+# passed to build_xtalk_matrix
+matrix:
+  # highest FIT_STATUS code to accept into the matrix; 2 is "low_stats", i.e.
+  # elements whose mu and sigma are the moments of the histogram rather than a
+  # fit are kept, and failed fits are not
+  max_status: 2
+  # every element has to have been produced with the settings above
+  require_same_parameters: true
+
+# passed to plot_xtalk_matrix as keyword arguments; the colour scale defaults
+# to the per-polarity range in XTC_PLOT_RANGE when vmin/vmax are left out
+plot:
+  figsize: [8, 6]
