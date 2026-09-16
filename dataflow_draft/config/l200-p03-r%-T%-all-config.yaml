@@ -17,19 +17,21 @@ snakemake_rules:
       logging: $_/log/basic_logging.yaml
       logger: prod
 
-  # one config file for both cross-talk steps: the matrix and the detectors it
-  # is measured from have to agree on the selections, and build_xtalk_matrix
-  # refuses to assemble elements that were produced with different ones
+  # the xtc_config files are merged in order, the flags over the settings
   pars_geds_xtc_detector_info:
     inputs:
-      xtc_config: $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+      xtc_config:
+        - $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+        - $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_flags.yaml
     options:
       logging: $_/log/basic_logging.yaml
       logger: prod
 
   pars_geds_xtc_matrix:
     inputs:
-      xtc_config: $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+      xtc_config:
+        - $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+        - $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_flags.yaml
     options:
       logging: $_/log/basic_logging.yaml
       logger: prod

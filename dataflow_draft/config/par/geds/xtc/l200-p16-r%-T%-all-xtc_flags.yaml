@@ -1,0 +1,10 @@
+# Flag conditions of the prepare_detector selections from p16 on, in place of
+# l200-p03-r%-T%-all-xtc_flags.yaml; see that file for what each one selects.
+detector:
+  baseline_conditions:
+    is_empty_candidate: 63
+
+  trigger_conditions:
+    is_highly_positive_polarity_candidate: 511
+
+  response_conditions: {}

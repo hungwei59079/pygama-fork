@@ -1,0 +1,15 @@
+# Merged over l200-p03-r%-T%-all-config.yaml from p16 on (see validity.yaml), so
+# only what changes is here: the cross-talk steps read the p16 flags.  A list is
+# replaced rather than merged, so each xtc_config list is given in full.
+snakemake_rules:
+  pars_geds_xtc_detector_info:
+    inputs:
+      xtc_config:
+        - $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+        - $_/par/geds/xtc/l200-p16-r%-T%-all-xtc_flags.yaml
+
+  pars_geds_xtc_matrix:
+    inputs:
+      xtc_config:
+        - $_/par/geds/xtc/l200-p03-r%-T%-all-xtc_config.yaml
+        - $_/par/geds/xtc/l200-p16-r%-T%-all-xtc_flags.yaml

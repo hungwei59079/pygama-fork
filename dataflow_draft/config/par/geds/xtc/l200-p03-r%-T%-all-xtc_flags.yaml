@@ -1,0 +1,17 @@
+# Flag conditions of the prepare_detector selections, merged over
+# l200-p03-r%-T%-all-xtc_config.yaml.  These are the flags of the older hit
+# tier, e.g. p08 of the old cross-talk production; l200-p16-r%-T%-all-xtc_flags.yaml
+# takes over from p16 on.
+detector:
+  # events in which the detector saw nothing, averaged to give the baselines
+  # that are subtracted from the response amplitudes
+  baseline_conditions:
+    is_baseline: 63
+
+  # events in which the detector fired
+  trigger_conditions:
+    is_discharge: false
+    is_valid_0vbb_old: true
+
+  # events in which the detector did not see a real hit
+  response_conditions: {}

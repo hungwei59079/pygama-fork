@@ -9,3 +9,10 @@
   category: all
   apply:
     - l200-p03-r%-T%-all-config.yaml
+
+# first p16 file (cal r000) of prod-blind v2.0.0
+- valid_from: 20250827T125510Z
+  category: all
+  mode: append
+  apply:
+    - l200-p16-r%-T%-all-config.yaml

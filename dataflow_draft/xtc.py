@@ -50,36 +50,25 @@ from pygama.pargen.xtc import (  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-#: The cross-talk ratio is only meaningful when every detector reads out on
-#: every trigger, so only the datatypes taken in that trigger mode are
-#: supported.
 SUPPORTED_DATATYPES = ("ssc", "xtc")
 
-#: Group the cross-talk table is written under.  ``pygama.evt.modules.xtalk``
-#: reads ``xtc/rawid_index`` and ``xtc/xtalk_matrix_{negative,positive}`` by
-#: default, so the name is not free to change.
+#: Group the cross-talk table is written under.  
 XTC_LH5_GROUP = "xtc"
 
-#: Fields of a :func:`~pygama.pargen.xtc.prepare_detector` result that are
-#: written as lh5 datasets.  They are the only large ones.
+#: Categories grouping fields in the detector info for type conversion before writing to lh5
 DETECTOR_INFO_ARRAYS = ("response_keep", "trigger_idxs", "trigger_amplitudes")
-
-#: Fields written as lh5 scalars.  The two baselines are ``None`` when they
-#: could not be measured and are stored as NaN; the three flags are booleans
-#: and are stored as 0/1.
 DETECTOR_INFO_BASELINES = ("positive_baseline", "negative_baseline")
 DETECTOR_INFO_FLAGS = ("read_success", "baseline_success", "trigger_success")
 
-#: Per-element histograms, dropped once the element has been fitted.  They are
-#: about 22 kB an element, which over the N^2 elements of a full array is more
-#: memory than the matrix they feed is worth.
+#: Fields to drop that are only used for fitting, not to assemble the matrix.
 ELEMENT_HISTOGRAM_FIELDS = tuple(
     f"{polarity}_{field}" for polarity in ("neg", "pos") for field in ("counts", "bins")
 )
 
 
 def _check_datatype(datatype: str) -> None:
-    """Raise unless *datatype* is one this routine can be run on."""
+    """Currently the only two datatypes that could be used are ssc and xtc. 
+    Subject to change in the future."""
     if datatype not in SUPPORTED_DATATYPES:
         msg = (
             f"unsupported datatype {datatype}: the cross-talk measurement needs "
@@ -91,18 +80,6 @@ def _check_datatype(datatype: str) -> None:
 
 def _expand_filelist(files: list[str] | None) -> list[str]:
     """Resolve any ``.filelist`` arguments to the sorted files they name.
-
-    Snakemake hands long file lists over as ``.filelist`` files rather than as
-    thousands of arguments -- one per run, so a rule spanning several runs
-    passes several of them.  Entries that are not ``.filelist`` files are
-    already paths to data and are taken as they are.
-
-    Sorting and de-duplicating whichever form was given is what makes a hit
-    list and a dsp list line up: the tier is the only part of the two paths
-    that differs, so the same sort puts both in the same run order, which is
-    the order :func:`~pygama.pargen.xtc.prepare_detector` needs them in to
-    match an event in one tier to the same event in the other.  The duplicates
-    are real -- a file can be named by both a run filelist and a period one.
     """
     expanded = []
     for entry in files or []:
@@ -115,24 +92,12 @@ def _expand_filelist(files: list[str] | None) -> list[str]:
     return sorted(set(expanded))
 
 
-def _parse_rawid(rawid: str) -> int:
-    """``"1104000"`` or ``"ch1104000"`` to ``1104000``."""
-    rawid = str(rawid)
-    return int(rawid[2:] if rawid.startswith("ch") else rawid)
-
-
 def _write_detector_info(detector_info: dict, output: str) -> None:
     """Write one :func:`~pygama.pargen.xtc.prepare_detector` result to lh5.
-
-    The per-event arrays become the datasets of a ``ch{rawid}`` struct and the
-    scalars its :class:`~lgdo.types.scalar.Scalar` fields.  What is neither --
-    the detector id, the timestamp and the nested ``parameters`` dict -- is
-    json-encoded into the struct's attributes, ``parameters`` because
-    :func:`~pygama.pargen.xtc.attach_response_amps` reads the dsp files and
-    fields back out of it in the second step.
     """
     detector_id = detector_info["detector_id"]
 
+    # Necessary type conversions before writing to lh5 
     obj_dict = {
         name: lgdo.Array(np.asarray(detector_info[name]))
         for name in DETECTOR_INFO_ARRAYS
@@ -148,9 +113,6 @@ def _write_detector_info(detector_info: dict, output: str) -> None:
         obj_dict=obj_dict,
         attrs={
             "detector_id": str(detector_id),
-            # the rule knows it, and carrying it here is what lets the matrix
-            # step name a detector without a channel map of its own
-            "detector_name": str(detector_info.get("detector_name") or ""),
             "processed_at": detector_info["processed_at"],
             "parameters": json.dumps(detector_info["parameters"]),
         },
@@ -160,19 +122,8 @@ def _write_detector_info(detector_info: dict, output: str) -> None:
     lh5.write(struct, name=f"ch{detector_id}", lh5_file=output, wo_mode="of")
 
 
-def _detector_name(detector_info: dict) -> str:
-    """``"1104000 (V02160A)"``, for a log line somebody has to read."""
-    name = detector_info.get("detector_name")
-    return f"{detector_info['detector_id']}{f' ({name})' if name else ''}"
-
-
 def _read_detector_info(path: str) -> dict:
-    """Read back what :func:`_write_detector_info` wrote.
-
-    The returned dict is what :func:`~pygama.pargen.xtc.prepare_detector`
-    returned, minus nothing that the second step uses.  The channel is taken
-    from the file rather than from its name, so the caller does not have to
-    know which channel it is handing over.
+    """Read back necessary information from what :func:`_write_detector_info` wrote.
     """
     groups = lh5.ls(path)
     if len(groups) != 1:
@@ -185,8 +136,7 @@ def _read_detector_info(path: str) -> dict:
     struct = lh5.read(groups[0], path)
 
     detector_info = {
-        "detector_id": _parse_rawid(struct.attrs["detector_id"]),
-        "detector_name": struct.attrs.get("detector_name", ""),
+        "detector_id": int(struct.attrs["detector_id"]),
         "processed_at": struct.attrs["processed_at"],
         "parameters": json.loads(struct.attrs["parameters"]),
         "n_rows": int(struct["n_rows"].value),
@@ -213,8 +163,6 @@ def build_xtc_detector_info() -> None:
 
     argparser.add_argument("--datatype", help="datatype", type=str, required=True)
     argparser.add_argument("--timestamp", help="timestamp", type=str, required=True)
-    # the rule resolves the detector name its output file is keyed by to the
-    # rawid the tiers are keyed by, so that this script needs no channel map
     argparser.add_argument("--channel", help="channel name", type=str, required=True)
     argparser.add_argument("--rawid", help="rawid", type=str, required=True)
 
@@ -231,8 +179,6 @@ def build_xtc_detector_info() -> None:
     )
     log = build_log(df_config, args.log)
 
-    # both steps read the same file, so that the matrix and the detectors it is
-    # measured from cannot be configured apart from one another
     config = Props.read_from(df_config.inputs.xtc_config)
 
     hit_files = _expand_filelist(args.hit_files)
@@ -244,7 +190,7 @@ def build_xtc_detector_info() -> None:
         )
         raise ValueError(msg)
 
-    rawid = _parse_rawid(args.rawid)
+    rawid = int(args.rawid)
     log.info(
         "preparing channel %s (%s) from %s hit and %s dsp files",
         rawid,
@@ -260,8 +206,6 @@ def build_xtc_detector_info() -> None:
         config=config.get("detector", {}),
         debug_mode=args.debug,
     )
-    detector_info["detector_name"] = args.channel
-
     _write_detector_info(detector_info, args.output)
     log.info("wrote the selections of channel %s to %s", rawid, args.output)
 
@@ -318,7 +262,7 @@ def build_xtc_matrix() -> None:
         "measuring the %s x %s elements of %s",
         len(rawids),
         len(rawids),
-        ", ".join(_detector_name(detector_info[rawid]) for rawid in rawids),
+        ", ".join(str(rawid) for rawid in rawids),
     )
 
     # responding detector on the outside: attaching its amplitudes reads its
