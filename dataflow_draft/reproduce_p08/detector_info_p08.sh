@@ -12,19 +12,29 @@
 #SBATCH -A m2676
 
 # First stage of reproducing the p08 cross-talk matrix through the dataflow
-# entry point, `xtc.py detector-info`.  One array task per detector: p08 has
-# 101 channels, so 0-100, and the task id indexes chn_id in FILE_LIST and the
-# channel/rawid lists in CHANNEL_LIST, which are in the same order.
+# entry point, `xtc.py detector-info`.  One array task per germanium channel:
+# task n runs on line n+1 of the channel list.
 #
-# Submit from the repository root.  The log directory in the #SBATCH lines
-# above is opened before this script runs, so it has to exist at submit time:
+# Submit from the repository root, after writing the filelists and the channel
+# list once, which prints the --array range (0-100 for p08):
+#   python dataflow_draft/dataflow_inputs.py \
+#       --data-dir /global/cfs/cdirs/m2676/data/lngs/l200/scratch/crosstalk_data/xtc \
+#       --datatype xtc --period p08 --run r015 \
+#       --output-dir /pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/filelists
+#
+# The log directory in the #SBATCH lines above is opened before this script
+# runs, so it has to exist at submit time:
 #   mkdir -p /pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs
 
 TEMP_DIR=${TEMP_DIR:-/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08}
-FILE_LIST=${FILE_LIST:-reproduce/test_p08.json}
-CHANNEL_LIST=${CHANNEL_LIST:-dataflow_draft/reproduce_p08/channels_p08.json}
 CONFIGS=${CONFIGS:-dataflow_draft/config}
+PERIOD=p08
+RUN=r015
 DATATYPE=xtc
+
+KEYPART="l200-${PERIOD}-${RUN}-${DATATYPE}"
+FILELIST_DIR="${TEMP_DIR}/filelists"
+CHANNEL_LIST="${FILELIST_DIR}/${KEYPART}-channels.txt"
 
 # Always work from the repository root
 REPO_ROOT=${SLURM_SUBMIT_DIR:-$(dirname "$(dirname "$(dirname "$(readlink -f "$0")")")")}
@@ -34,44 +44,17 @@ source .venv/bin/activate
 
 set -eo pipefail
 
-FILELIST_DIR="${TEMP_DIR}/filelists"
-mkdir -p "${FILELIST_DIR}" "${TEMP_DIR}/logs" "${TEMP_DIR}/detector_info"
+mkdir -p "${TEMP_DIR}/logs" "${TEMP_DIR}/detector_info"
 
-# Writes the hit and dsp filelists the dataflow would hand the rule, and prints
-# this task's timestamp, channel and rawid.  The timestamp is the earliest of
-# all the files in FILE_LIST.
-TASK_INPUTS=$(python - "${FILE_LIST}" "${CHANNEL_LIST}" "${SLURM_ARRAY_TASK_ID}" "${FILELIST_DIR}" <<'EOF'
-import json
-import os
-import re
-import sys
-from pathlib import Path
-
-file_list, channel_list, index, filelist_dir = sys.argv[1:]
-files = json.loads(Path(file_list).read_text())
-channels = json.loads(Path(channel_list).read_text())
-index = int(index)
-
-rawid = channels["rawid"][index]
-if rawid != files["chn_id"][index]:
-    sys.exit(f"index {index} is rawid {rawid} in {channel_list} but {files['chn_id'][index]} in {file_list}")
-
-# every task writes the same filelists, so writing to a temporary file and
-# renaming it is enough to keep a task from reading one half written
-for tier in ("hit", "dsp"):
-    filelist = Path(filelist_dir) / f"all-l200-p08-r015-xtc-{tier}.filelist"
-    tmp = filelist.with_name(f"{filelist.name}.{index}.tmp")
-    tmp.write_text("\n".join(files[tier]) + "\n")
-    os.replace(tmp, filelist)
-
-timestamp = min(re.search(r"\d{8}T\d{6}Z", f).group() for f in files["hit"] + files["dsp"])
-print(timestamp, channels["channel"][index], rawid)
-EOF
-)
-read -r TIMESTAMP CHANNEL RAWID <<< "${TASK_INPUTS}"
+CHANNEL_LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "${CHANNEL_LIST}")
+if [[ -z "${CHANNEL_LINE}" ]]; then
+    echo "task ${SLURM_ARRAY_TASK_ID} is past the last channel in ${CHANNEL_LIST}" >&2
+    exit 1
+fi
+read -r TIMESTAMP CHANNEL RAWID <<< "${CHANNEL_LINE}"
 
 # named like the dataflow's per-channel temporary pars and logs
-KEY="l200-p08-r015-${DATATYPE}-${TIMESTAMP}-${CHANNEL}"
+KEY="${KEYPART}-${TIMESTAMP}-${CHANNEL}"
 OUTPUT="${TEMP_DIR}/detector_info/${KEY}-par_xtc_detector_info.lh5"
 LOG="${TEMP_DIR}/logs/${KEY}-pars_geds_xtc_detector_info.log"
 
@@ -80,8 +63,8 @@ hostname
 echo "Running detector-info on ${CHANNEL} (rawid ${RAWID}, index ${SLURM_ARRAY_TASK_ID}) at ${TIMESTAMP}, results in ${OUTPUT}"
 
 python dataflow_draft/xtc.py detector-info \
-    --hit-files "${FILELIST_DIR}/all-l200-p08-r015-xtc-hit.filelist" \
-    --dsp-files "${FILELIST_DIR}/all-l200-p08-r015-xtc-dsp.filelist" \
+    --hit-files "${FILELIST_DIR}/all-${KEYPART}-hit.filelist" \
+    --dsp-files "${FILELIST_DIR}/all-${KEYPART}-dsp.filelist" \
     --configs "${CONFIGS}" \
     --log "${LOG}" \
     --datatype "${DATATYPE}" \

@@ -35,7 +35,7 @@ import lh5
 import matplotlib as mpl
 import numpy as np
 from dbetto import Props, TextDB
-from legenddataflowscripts.utils import build_log
+from legenddataflowscripts.utils import build_log, expand_filelist
 
 mpl.use("Agg")
 
@@ -76,20 +76,6 @@ def _check_datatype(datatype: str) -> None:
             f"for {SUPPORTED_DATATYPES}"
         )
         raise NotImplementedError(msg)
-
-
-def _expand_filelist(files: list[str] | None) -> list[str]:
-    """Resolve any ``.filelist`` arguments to the sorted files they name.
-    """
-    expanded = []
-    for entry in files or []:
-        if Path(entry).suffix == ".filelist":
-            with Path(entry).open() as f:
-                expanded += [line for line in f.read().splitlines() if line]
-        else:
-            expanded.append(entry)
-
-    return sorted(set(expanded))
 
 
 def _write_detector_info(detector_info: dict, output: str) -> None:
@@ -181,14 +167,8 @@ def build_xtc_detector_info() -> None:
 
     config = Props.read_from(df_config.inputs.xtc_config)
 
-    hit_files = _expand_filelist(args.hit_files)
-    dsp_files = _expand_filelist(args.dsp_files)
-    if not hit_files or not dsp_files:
-        msg = (
-            f"channel {args.rawid} was given {len(hit_files)} hit files and "
-            f"{len(dsp_files)} dsp files, and it needs both"
-        )
-        raise ValueError(msg)
+    hit_files = expand_filelist(args.hit_files, "--hit-files")
+    dsp_files = expand_filelist(args.dsp_files, "--dsp-files")
 
     rawid = int(args.rawid)
     log.info(
@@ -239,9 +219,7 @@ def build_xtc_matrix() -> None:
 
     config = Props.read_from(df_config.inputs.xtc_config)
 
-    # every channel is held at once: the pairs are measured against each other,
-    # so re-reading one per pair would be N^2 reads of the same file
-    detector_files = _expand_filelist(args.detector_files)
+    detector_files = expand_filelist(args.detector_files, "--detector-files")
     detector_info = {}
     for path in detector_files:
         info = _read_detector_info(path)
@@ -250,10 +228,6 @@ def build_xtc_matrix() -> None:
             msg = f"channel {rawid} was prepared by more than one input file"
             raise ValueError(msg)
         detector_info[rawid] = info
-
-    if not detector_info:
-        msg = "no detector info files were given, so there is nothing to measure"
-        raise ValueError(msg)
 
     # the matrix is indexed in this order, so fix it rather than leaving it to
     # the order snakemake happened to pass the files in
