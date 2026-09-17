@@ -229,8 +229,6 @@ def build_xtc_matrix() -> None:
             raise ValueError(msg)
         detector_info[rawid] = info
 
-    # the matrix is indexed in this order, so fix it rather than leaving it to
-    # the order snakemake happened to pass the files in
     rawids = sorted(detector_info)
     log.info(
         "measuring the %s x %s elements of %s",
@@ -239,9 +237,6 @@ def build_xtc_matrix() -> None:
         ", ".join(str(rawid) for rawid in rawids),
     )
 
-    # responding detector on the outside: attaching its amplitudes reads its
-    # dsp files, which is the expensive part, and the triggering detector needs
-    # nothing that is not already in its detector info
     element_config = config.get("element", {})
     fitted_elements = []
     for response_id in rawids:
@@ -254,22 +249,15 @@ def build_xtc_matrix() -> None:
                 response_info,
                 config=element_config,
                 debug_mode=args.debug,
-            )
+            ) # `element` is a dict including xtalk value itself and lots of other info
             for field in ELEMENT_HISTOGRAM_FIELDS:
-                element.pop(field, None)
+                element.pop(field, None) # pop the fields that won't be saved to the matrix. 
             fitted_elements.append(element)
-        del response_info
+        del response_info # it includes the full dsp amplitude array, release it to save memory
 
-    xtalk_table = build_xtalk_matrix(fitted_elements, config=config.get("matrix", {}))
-
-    # TODO: review if this is really necessary 
-    written_rawids = xtalk_table["rawid_index"].nda
-    if not np.array_equal(written_rawids, rawids):
-        msg = (
-            f"the matrix is indexed {written_rawids.tolist()} but its elements "
-            f"were measured over {rawids}"
-        )
-        raise RuntimeError(msg)
+    xtalk_table = build_xtalk_matrix(
+        fitted_elements, rawids, config=config.get("matrix", {})
+    )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     lh5.write(xtalk_table, name=XTC_LH5_GROUP, lh5_file=args.output, wo_mode="of")
@@ -296,6 +284,9 @@ def build_xtc_matrix() -> None:
         log.info("wrote the cross-talk matrix plots to %s", args.plot_file)
 
 
+# --------------------------------------------------
+#: Snakemake don't need these. Remove them once moved to legend-dataflow
+#: These are used by SLURM scripts to call the two steps directly.
 #: The two steps, under the names ``python xtc.py <step>`` takes.
 STEPS = {
     "detector-info": build_xtc_detector_info,

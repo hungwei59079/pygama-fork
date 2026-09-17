@@ -842,6 +842,7 @@ def _differing_keys(left: dict, right: dict, prefix: str = "") -> list[str]:
 
 def build_xtalk_matrix(
     fitted_elements: list[dict],
+    rawids: list[int] | None = None,
     config: dict | None = None,
 ) -> lgdo.Table:
     """Assemble measured cross-talk elements into the matrix.
@@ -853,7 +854,10 @@ def build_xtalk_matrix(
     Parameters
     ----------
     fitted_elements
-        List of :func:`xtalk_element` results. 
+        List of :func:`xtalk_element` results.
+    rawids
+        Order to index the matrix in.  Must hold exactly the channel ids seen
+        in ``fitted_elements``.  ``None`` takes them in first-seen order.
     config
         Recognised keys, all optional:
 
@@ -889,11 +893,25 @@ def build_xtalk_matrix(
     max_status = int(config.get("max_status", FIT_STATUS["low_stats"]))
     require_same_parameters = bool(config.get("require_same_parameters", True))
 
-    # dict keys keep insertion order, so this is first-seen order
+    # index the rawids by first seen order by default 
     index_of: dict[int, int] = {}
     for element in fitted_elements:
         for key in ("trigger_id", "response_id"):
             index_of.setdefault(int(element[key]), len(index_of))
+
+    # if rawids is given, use it to index the matrix instead
+    if rawids is not None:
+        rawids = [int(rawid) for rawid in rawids]
+        if len(set(rawids)) != len(rawids):
+            msg = f"rawids {rawids} hold repeated channel ids"
+            raise ValueError(msg)
+        if set(rawids) != set(index_of):
+            msg = (
+                f"rawids {sorted(rawids)} are not the channel ids seen in the "
+                f"elements {sorted(index_of)}"
+            )
+            raise ValueError(msg)
+        index_of = {rawid: i for i, rawid in enumerate(rawids)}
 
     rawids = list(index_of)
     n_detectors = len(rawids)

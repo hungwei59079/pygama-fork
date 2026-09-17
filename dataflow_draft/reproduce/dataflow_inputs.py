@@ -8,12 +8,14 @@ all-l200-{period}-{run}-{datatype}-{hit,dsp}.filelist
     the files of each tier, one per line
 l200-{period}-{run}-{datatype}-channels.txt
     one "timestamp channel rawid" line per germanium channel, sorted by
-    channel name, for a SLURM array task to pick its line from
+    channel name, for a detector-info array task to pick its line from, and
+    for the matrix job to list the detector info files it reads
 
 Unlike the dataflow, every geds channel is kept, whether or not its detector
 status is processable, so that the channels match the earlier analysis.
 
-Run it once per run before submitting the array; it prints the --array range.
+Run it once per run before submitting detector_info_submitter.sh; it prints
+the --array range.
 """
 
 import argparse

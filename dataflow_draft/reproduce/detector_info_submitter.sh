@@ -1,36 +1,44 @@
 #!/bin/bash
+# Change the lines marked with DATASET to run on a different dataset. 
+
+# DATASET: period and run in the job name and log paths (mkdir the new logs/ first)
 #SBATCH --job-name=xtc_detector_info_p08
+
 #SBATCH --output=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/detector_info_p08_%A_%a.out
 #SBATCH --error=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/detector_info_p08_%A_%a.err
 #SBATCH --time=02:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
+
+# DATASET: the range dataflow_inputs.py prints
 #SBATCH --array=0-100%50
+
 #SBATCH -q shared
 #SBATCH -C cpu
 #SBATCH -A m2676
 
-# First stage of reproducing the p08 cross-talk matrix through the dataflow
-# entry point, `xtc.py detector-info`.  One array task per germanium channel:
-# task n runs on line n+1 of the channel list.
-#
 # Submit from the repository root, after writing the filelists and the channel
 # list once, which prints the --array range (0-100 for p08):
-#   python dataflow_draft/dataflow_inputs.py \
+#   python dataflow_draft/reproduce/dataflow_inputs.py \
 #       --data-dir /global/cfs/cdirs/m2676/data/lngs/l200/scratch/crosstalk_data/xtc \
 #       --datatype xtc --period p08 --run r015 \
-#       --output-dir /pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/filelists
-#
-# The log directory in the #SBATCH lines above is opened before this script
-# runs, so it has to exist at submit time:
-#   mkdir -p /pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs
+#       --output-dir $SCRATCH/reproduce_with_dataflow_p08/filelists
 
-TEMP_DIR=${TEMP_DIR:-/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08}
-CONFIGS=${CONFIGS:-dataflow_draft/config}
+
+# DATASET: for p16 (one run at a time, r008 to r018; 60 geds in the old analysis)
+#       --data-dir /global/cfs/projectdirs/m2676/data/lngs/l200/public/prodenv/prod-blind/auto/v2.0.0
+#       --datatype ssc --period p16 --run r008
+#       --output-dir $SCRATCH/reproduce_with_dataflow_p16/filelists
+
+
+# DATASET: p16 is PERIOD=p16, RUN=r008 to r018, DATATYPE=ssc
 PERIOD=p08
 RUN=r015
 DATATYPE=xtc
+
+TEMP_DIR=${TEMP_DIR:-/pscratch/sd/h/hungwei/reproduce_with_dataflow_${PERIOD}}
+CONFIGS=${CONFIGS:-dataflow_draft/config}
 
 KEYPART="l200-${PERIOD}-${RUN}-${DATATYPE}"
 FILELIST_DIR="${TEMP_DIR}/filelists"
