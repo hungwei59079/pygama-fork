@@ -4,7 +4,7 @@ germanium detectors and for building the resulting cross-talk matrix.
 
 The four main functions, in order of execution, are:
 prepare_detector, attach_response_amps, xtalk_element, and build_xtalk_matrix.
-The others are just helpers. 
+The others are just helpers.
 """
 
 from __future__ import annotations
@@ -53,8 +53,8 @@ FIT_STATUS_SUCCESS = (FIT_STATUS["ok"], FIT_STATUS["ok_few_points"])
 XTC_LH5_FIELD = {"neg": "xtalk_matrix_negative", "pos": "xtalk_matrix_positive"}
 XTC_PLOT_RANGE = {"neg": (-0.003, 0.001), "pos": (-0.0007, 0.003)}
 
-# Keys that will be copied into the xtalk table as attributes to record 
-# the settings during production. 
+# Keys that will be copied into the xtalk table as attributes to record
+# the settings during production.
 XTC_SELECTION_KEYS = {
     "trigger": (
         "energy_param",
@@ -92,7 +92,7 @@ def _selection_mask(
     Rows of *table* that survive the event cuts, as a boolean mask.
     """
     energies = table[ene_field].nda
-    mask = np.isfinite(energies) 
+    mask = np.isfinite(energies)
 
     for flag, value in (conditions or {}).items():
         mask &= table[flag].nda == value
@@ -271,8 +271,12 @@ def prepare_detector(
         try:
             positive_baseline_vals = positive_amps[baseline_mask]
             negative_baseline_vals = negative_amps[baseline_mask]
-            positive_baseline_vals = positive_baseline_vals[np.isfinite(positive_baseline_vals)]
-            negative_baseline_vals = negative_baseline_vals[np.isfinite(negative_baseline_vals)]
+            positive_baseline_vals = positive_baseline_vals[
+                np.isfinite(positive_baseline_vals)
+            ]
+            negative_baseline_vals = negative_baseline_vals[
+                np.isfinite(negative_baseline_vals)
+            ]
             if len(positive_baseline_vals) == 0 or len(negative_baseline_vals) == 0:
                 msg = "no events passed the baseline selection"
                 raise RuntimeError(msg)
@@ -522,7 +526,7 @@ def _fit_gaussian_with_fallbacks(
 
     x = pgh.get_bin_centers(bins)
 
-    # too few counts, fallback to histogram arithmetic mean 
+    # too few counts, fallback to histogram arithmetic mean
     if total_counts < low_stats_threshold:
         mu = float(np.sum(x * y) / total_counts)
         sigma = float(np.sqrt(np.sum(y * (x - mu) ** 2) / total_counts))
@@ -543,7 +547,7 @@ def _fit_gaussian_with_fallbacks(
     mu_0 = float(np.average(x_fit, weights=y_fit))
     sigma_0 = float(np.sqrt(np.average((x_fit - mu_0) ** 2, weights=y_fit)))
     if sigma_0 <= 0:
-        sigma_0 = float(x[1] - x[0]) if len(x) > 1 else 1.0 # Prevent ZeroDivisionError
+        sigma_0 = float(x[1] - x[0]) if len(x) > 1 else 1.0  # Prevent ZeroDivisionError
 
     try:
         popt, _ = curve_fit(nb_gauss_amp, x_fit, y_fit, p0=[mu_0, sigma_0, amplitude_0])
@@ -713,7 +717,6 @@ def xtalk_element(
                 )
                 raise IndexError(msg)
 
-
             keep = response_keep[trigger_idxs]
             coincident_idxs = trigger_idxs[keep]
             trigger_amplitudes = trigger_amplitudes_all[keep]
@@ -796,7 +799,7 @@ def xtalk_element(
         result[f"{polarity}_total_counts"] = int(total_counts)
         result[f"{polarity}_status"] = int(status)
         result[f"{polarity}_success"] = int(status) in FIT_STATUS_SUCCESS
-    
+
     trigger_parameters = trigger_detector_info.get("parameters", {})
     response_parameters = response_detector_info.get("parameters", {})
 
@@ -808,8 +811,16 @@ def xtalk_element(
         "low_stats_threshold": low_stats_threshold,
         "y_mask_threshold": y_mask_threshold,
         "sharp_fit_min_points": sharp_fit_min_points,
-        "trigger_selection_parameters": {key: trigger_parameters[key] for key in XTC_SELECTION_KEYS["trigger"] if key in trigger_parameters},
-        "response_selection_parameters": {key: response_parameters[key] for key in XTC_SELECTION_KEYS["response"] if key in response_parameters},
+        "trigger_selection_parameters": {
+            key: trigger_parameters[key]
+            for key in XTC_SELECTION_KEYS["trigger"]
+            if key in trigger_parameters
+        },
+        "response_selection_parameters": {
+            key: response_parameters[key]
+            for key in XTC_SELECTION_KEYS["response"]
+            if key in response_parameters
+        },
     }
     result["fit_status_codes"] = FIT_STATUS
     result["processed_at"] = datetime.now().isoformat()
@@ -878,7 +889,7 @@ def build_xtalk_matrix(
             ``rawid_index[i]`` is the channel id of the detector corresponding to
             row or column *i* of the matrix.
         ``xtalk_matrix_negative``, ``xtalk_matrix_positive`` ``(N, N)``
-            The fitted peak positions, i.e., the xtalk values, as **fractions**. 
+            The fitted peak positions, i.e., the xtalk values, as **fractions**.
         ``..._sigma`` ``(N, N)``
             The width of each of those fits, also as fractions.
         ``..._status`` ``(N, N)``
@@ -893,7 +904,7 @@ def build_xtalk_matrix(
     max_status = int(config.get("max_status", FIT_STATUS["low_stats"]))
     require_same_parameters = bool(config.get("require_same_parameters", True))
 
-    # index the rawids by first seen order by default 
+    # index the rawids by first seen order by default
     index_of: dict[int, int] = {}
     for element in fitted_elements:
         for key in ("trigger_id", "response_id"):
@@ -938,7 +949,9 @@ def build_xtalk_matrix(
         placed.add((row, col))
 
         parameters = element.get("parameters") or {}
-        element_settings = {key: parameters[key] for key in XTC_SETTING_KEYS if key in parameters}
+        element_settings = {
+            key: parameters[key] for key in XTC_SETTING_KEYS if key in parameters
+        }
 
         if settings is None:
             settings = element_settings
