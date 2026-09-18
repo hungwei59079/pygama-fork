@@ -3,9 +3,9 @@
 
 # DATASET: period and run in the job name and log paths (mkdir the new logs/ first)
 #SBATCH --job-name=xtc_detector_info_p08
-
 #SBATCH --output=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/detector_info_p08_%A_%a.out
 #SBATCH --error=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/detector_info_p08_%A_%a.err
+
 #SBATCH --time=02:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -18,6 +18,7 @@
 #SBATCH -C cpu
 #SBATCH -A m2676
 
+# DATASET: Do this first before submitting the job
 # Submit from the repository root, after writing the filelists and the channel
 # list once, which prints the --array range (0-100 for p08):
 #   python dataflow_draft/reproduce/dataflow_inputs.py \
