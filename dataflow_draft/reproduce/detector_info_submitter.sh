@@ -2,9 +2,9 @@
 # Change the lines marked with DATASET to run on a different dataset. 
 
 # DATASET: period and run in the job name and log paths (mkdir the new logs/ first)
-#SBATCH --job-name=xtc_detector_info_p08
-#SBATCH --output=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/detector_info_p08_%A_%a.out
-#SBATCH --error=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/detector_info_p08_%A_%a.err
+#SBATCH --job-name=xtc_detector_info_p16
+#SBATCH --output=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p16/logs/detector_info_p16_%A_%a.out
+#SBATCH --error=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p16/logs/detector_info_p16_%A_%a.err
 
 #SBATCH --time=02:00:00
 #SBATCH --nodes=1
@@ -12,7 +12,7 @@
 #SBATCH --cpus-per-task=1
 
 # DATASET: the range dataflow_inputs.py prints
-#SBATCH --array=0-100%50
+#SBATCH --array=0-59%60
 
 #SBATCH -q shared
 #SBATCH -C cpu
@@ -27,16 +27,18 @@
 #       --output-dir $SCRATCH/reproduce_with_dataflow_p08/filelists
 
 
-# DATASET: for p16 (one run at a time, r008 to r018; 60 geds in the old analysis)
-#       --data-dir /global/cfs/projectdirs/m2676/data/lngs/l200/public/prodenv/prod-blind/auto/v2.0.0
-#       --datatype ssc --period p16 --run r008
+# for p16, all of r008 to r018 in one measurement 
+#   python dataflow_draft/reproduce/dataflow_inputs.py \
+#       --data-dir /global/cfs/projectdirs/m2676/data/lngs/l200/public/prodenv/prod-blind/auto/v2.0.0 \
+#       --datatype ssc --period p16 \
+#       --run r008 r009 r010 r011 r012 r013 r014 r015 r016 r017 r018 \
 #       --output-dir $SCRATCH/reproduce_with_dataflow_p16/filelists
 
 
-# DATASET: p16 is PERIOD=p16, RUN=r008 to r018, DATATYPE=ssc
-PERIOD=p08
-RUN=r015
-DATATYPE=xtc
+# DATASET: p08 is PERIOD=p08, RUN=r015, DATATYPE=xtc
+PERIOD=p16
+RUN=r008_r018
+DATATYPE=ssc
 
 TEMP_DIR=${TEMP_DIR:-/pscratch/sd/h/hungwei/reproduce_with_dataflow_${PERIOD}}
 CONFIGS=${CONFIGS:-dataflow_draft/config}

@@ -2,9 +2,9 @@
 # Change the lines marked with DATASET to run on a different dataset.
 
 # DATASET: period and run in the job name and log paths (the logs/ of detector_info_submitter.sh)
-#SBATCH --job-name=xtc_matrix_p08
-#SBATCH --output=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/matrix_p08_%j.out
-#SBATCH --error=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p08/logs/matrix_p08_%j.err
+#SBATCH --job-name=xtc_matrix_p16
+#SBATCH --output=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p16/logs/matrix_p16_%j.out
+#SBATCH --error=/pscratch/sd/h/hungwei/reproduce_with_dataflow_p16/logs/matrix_p16_%j.err
 
 #SBATCH --time=12:00:00
 #SBATCH --nodes=1
@@ -15,18 +15,19 @@
 #SBATCH -C cpu
 #SBATCH -A m2676
 
-# One job per run, over the detector info detector_info_submitter.sh wrote for
-# every channel of the channel list.  Submit from the repository root once that
-# array has finished:
+# One job per measurement, over the detector info detector_info_submitter.sh
+# wrote for every channel of the channel list.  PERIOD, RUN and DATATYPE have to
+# be the ones that array ran with, so that KEYPART names the same files.  Submit
+# from the repository root once that array has finished:
 #   sbatch dataflow_draft/reproduce/matrix_submitter.sh
 # or right after submitting the array, to start when all of its tasks succeed:
 #   sbatch --dependency=afterok:<array job id> dataflow_draft/reproduce/matrix_submitter.sh
 
 
-# DATASET: p16 is PERIOD=p16, RUN=r008 to r018, DATATYPE=ssc
-PERIOD=p08
-RUN=r015
-DATATYPE=xtc
+# DATASET: p08 is PERIOD=p08, RUN=r015, DATATYPE=xtc
+PERIOD=p16
+RUN=r008_r018
+DATATYPE=ssc
 
 TEMP_DIR=${TEMP_DIR:-/pscratch/sd/h/hungwei/reproduce_with_dataflow_${PERIOD}}
 CONFIGS=${CONFIGS:-dataflow_draft/config}
