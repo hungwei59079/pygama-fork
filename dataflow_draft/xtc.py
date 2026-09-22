@@ -12,7 +12,7 @@ reading parallelises over channels the way the rest of the dataflow does:
     Runs once per run, over every channel's file from the first step.  Measures
     each ``(trigger, response)`` pair with
     :func:`~pygama.pargen.xtc.xtalk_element` and assembles them into the
-    cross-talk matrix with :func:`~pygama.pargen.xtc.build_xtalk_matrix`.
+    cross-talk matrix with :func:`~pygama.pargen.xtc.build_xtalk_matrix`. 
 
 Both steps are also runnable directly, which is what the SLURM/bash scripts
 that exercise them before there are snakemake rules do::
@@ -138,6 +138,48 @@ def _read_detector_info(path: str) -> dict:
     return detector_info
 
 
+def _resolve_channel_order(rawids: list[int] | None, detector_info: dict) -> list[int]:
+    """
+    Validate the given rawids list by comparing it to the detector info. If rawids 
+    is None, return the sorted list of prepared channels. 
+    """
+    prepared = set(detector_info)
+    if rawids is None:
+        return sorted(prepared)
+    if not rawids:
+        msg = (
+            "--rawids was given without any channel id, which is a channel "
+            "list that came out empty; leave it out to take every prepared "
+            "channel by ascending channel id"
+        )
+        raise ValueError(msg)
+
+    duplicated = sorted({rawid for rawid in rawids if rawids.count(rawid) > 1})
+    if duplicated:
+        msg = f"--rawids names the channels {duplicated} more than once"
+        raise ValueError(msg)
+
+    unprepared = [rawid for rawid in rawids if rawid not in prepared]
+    if unprepared:
+        msg = (
+            f"--rawids names the channels {unprepared}, which none of the "
+            f"detector info files holds"
+        )
+        raise ValueError(msg)
+
+    left_out = sorted(prepared - set(rawids))
+    if left_out:
+        log.info(
+            "measuring the %s channels --rawids names, out of the %s the "
+            "detector info holds; left out of the matrix: %s",
+            len(rawids),
+            len(prepared),
+            ", ".join(str(rawid) for rawid in left_out),
+        )
+
+    return list(rawids)
+
+
 def build_xtc_detector_info() -> None:
     """Prepare one channel for the cross-talk measurement."""
     argparser = argparse.ArgumentParser()
@@ -191,10 +233,20 @@ def build_xtc_detector_info() -> None:
 
 
 def build_xtc_matrix() -> None:
-    """Measure every pair of prepared channels and assemble the matrix."""
+    """Measure every pair of prepared channels and assemble the matrix.
+
+    ``--rawids`` names the channels the matrix holds, in the order it is
+    indexed in; without it, every prepared channel by ascending channel id.
+    """
     argparser = argparse.ArgumentParser()
     argparser.add_argument(
         "--detector-files", help="detector info files", nargs="*", required=True
+    )
+    argparser.add_argument(
+        "--rawids",
+        help="channel ids to measure, in the order to index the matrix in",
+        nargs="*",
+        type=int,
     )
 
     argparser.add_argument("--configs", help="configs path", type=str, required=True)
@@ -229,7 +281,7 @@ def build_xtc_matrix() -> None:
             raise ValueError(msg)
         detector_info[rawid] = info
 
-    rawids = sorted(detector_info)
+    rawids = _resolve_channel_order(args.rawids, detector_info)
     log.info(
         "measuring the %s x %s elements of %s",
         len(rawids),

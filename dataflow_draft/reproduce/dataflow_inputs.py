@@ -7,9 +7,10 @@ earliest timestamp, and writes, in the output directory:
 all-l200-{period}-{run}-{datatype}-{hit,dsp}.filelist
     the files of each tier, one per line
 l200-{period}-{run}-{datatype}-channels.txt
-    one "timestamp channel rawid" line per germanium channel, sorted by
-    channel name, for a detector-info array task to pick its line from, and
-    for the matrix job to list the detector info files it reads
+    one "timestamp channel rawid" line per germanium channel, in the order the
+    channel map lists them, for a detector-info array task to pick its line
+    from, and for the matrix job to list the detector info files it reads and
+    to pass the channel order the matrix is indexed in
 
 Unlike the dataflow, every geds channel is kept, whether or not its detector
 status is processable, so that the channels match the earlier analysis.
@@ -116,14 +117,20 @@ timestamp = min(hit_files)
 
 
 def geds_on(timestamp: str) -> dict[str, int]:
-    """The germanium channels of the channel map, name to rawid, by name."""
+    """The germanium channels of the channel map, name to rawid.
+
+    In the order the channel map itself lists them, which is the order the
+    matrix is indexed in and the one the earlier analysis used.  Sorting here,
+    by name or by rawid, would index the matrix differently -- correct either
+    way, but not comparable element by element with those results.
+    """
     chmap = (
         TextDB(args.data_dir / "inputs", lazy=True)
         .hardware.configuration.channelmaps.on(timestamp, system=args.datatype)
     )
     return {
         name: channel["daq"]["rawid"]
-        for name, channel in sorted(chmap.items())
+        for name, channel in chmap.items()
         if channel["system"] == "geds"
     }
 

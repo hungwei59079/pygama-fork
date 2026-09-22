@@ -51,13 +51,15 @@ mkdir -p "${TEMP_DIR}/logs" "${TEMP_DIR}/matrix"
 read -r TIMESTAMP _ < "${CHANNEL_LIST}"
 
 # Listed from the channel list rather than globbed, so that a channel whose detector-info task failed
-# stops the matrix instead of dropping out of it.
+# stops the matrix instead of dropping out of it. 
 : > "${DETECTOR_FILELIST}" # Empty the filelist file in case of resubmission
 TASK=0
 MISSING=0
+RAWIDS=()
 while read -r _ CHANNEL RAWID; do
     FILE="${TEMP_DIR}/detector_info/${KEYPART}-${TIMESTAMP}-${CHANNEL}-par_xtc_detector_info.lh5"
     echo "${FILE}" >> "${DETECTOR_FILELIST}"
+    RAWIDS+=("${RAWID}")
     if [[ ! -f "${FILE}" ]]; then
         echo "no detector info of ${CHANNEL} (rawid ${RAWID}), rerun detector_info_submitter.sh with --array=${TASK}" >&2
         MISSING=$((MISSING + 1))
@@ -78,10 +80,11 @@ LOG="${TEMP_DIR}/logs/${KEY}-pars_geds_xtc_matrix.log"
 
 date
 hostname
-echo "Running matrix on the ${TASK} channels listed in ${DETECTOR_FILELIST} at ${TIMESTAMP}, results in ${OUTPUT}"
+echo "Running matrix on the ${TASK} channels listed in ${DETECTOR_FILELIST} at ${TIMESTAMP}, indexed in the order of ${CHANNEL_LIST}, results in ${OUTPUT}"
 
 python dataflow_draft/xtc.py matrix \
     --detector-files "${DETECTOR_FILELIST}" \
+    --rawids "${RAWIDS[@]}" \
     --configs "${CONFIGS}" \
     --log "${LOG}" \
     --datatype "${DATATYPE}" \
